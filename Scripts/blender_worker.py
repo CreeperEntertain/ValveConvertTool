@@ -460,9 +460,26 @@ def ensure_sourceio_registered():
     import sys
     import bpy
 
-    if hasattr(bpy.types.Scene, "sourceio_props"):
+    legacy_scene_property_names = (
+        "TextureCachePath",
+        "use_bvlg",
+        "use_instances",
+        "import_materials",
+        "import_physics",
+        "replace_entity",
+        "mounted_resources",
+        "mounted_resources_index",
+    )
+
+    if (
+        hasattr(bpy.types.Scene, "sourceio_props")
+        or all(
+            hasattr(bpy.types.Scene, name)
+            for name in legacy_scene_property_names
+        )
+    ):
         print(
-            "[startup] SourceIO Scene properties already exist.",
+            "[startup] SourceIO Scene properties are already registered.",
             flush=True,
         )
         return
