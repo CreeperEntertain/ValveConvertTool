@@ -230,55 +230,32 @@ def scan_source_content(input_root):
 
 
 def import_vtf(input_root, input_path, output_path):
-    from SourceIO.library.source1.vtf import load_texture
-    from SourceIO.library.utils.tiny_path import TinyPath
-    from SourceIO.blender_bindings.utils.texture_utils import (
-        create_and_cache_texture,
-    )
-
     ensure_parent(output_path)
     relative_path = get_relative_input_path(input_root, input_path)
+    image_names_before = {image.name for image in bpy.data.images}
 
-    try:
-        with open(input_path, "rb") as texture_file:
-            rgba_data, image_height, image_width = load_texture(texture_file)
-    except OSError as exc:
-        raise UnsupportedTextureError(
-            f"Cannot read VTF file: {exc}"
-        ) from exc
-
-    if (
-        rgba_data is None
-        or image_height <= 0
-        or image_width <= 0
-        or getattr(rgba_data, "size", 0) == 0
-    ):
-        raise UnsupportedTextureError(
-            "SourceIO could not decode this VTF into pixel data. "
-            "The format may be unsupported by the installed decoder, "
-            "or the file may be damaged."
-        )
-
-    expected_shape = (image_height, image_width, 4)
-    if getattr(rgba_data, "shape", None) != expected_shape:
-        try:
-            rgba_data = rgba_data.reshape(expected_shape)
-        except (ValueError, TypeError) as exc:
-            raise UnsupportedTextureError(
-                f"Invalid decoded pixel dimensions: "
-                f"{getattr(rgba_data, 'shape', None)}; "
-                f"expected {expected_shape}."
-            ) from exc
-
-    image = create_and_cache_texture(
-        TinyPath(relative_path),
-        rgba_data,
-        False,
-        False,
+    bpy.ops.sourceio.vtf(
+        directory=input_root,
+        files=[{"name": relative_path}],
     )
 
+    new_images = [image for image in bpy.data.images if image.name not in image_names_before]
+    image = new_images[-1] if new_images else None
+
     if image is None:
-        raise UnsupportedTextureError("SourceIO decoded the VTF but did not create a Blender image.")
+        wanted_name = os.path.basename(input_path).casefold()
+        wanted_stem = os.path.splitext(wanted_name)[0]
+        for candidate in reversed(list(bpy.data.images)):
+            full_path = candidate.get("full_path", "")
+            if os.path.basename(full_path).casefold() == wanted_name:
+                image = candidate
+                break
+            if candidate.name.casefold() == wanted_stem:
+                image = candidate
+                break
+
+    if image is None:
+        raise RuntimeError("SourceIO did not produce a discoverable image.")
 
     image.filepath_raw = output_path
     image.file_format = "PNG"
