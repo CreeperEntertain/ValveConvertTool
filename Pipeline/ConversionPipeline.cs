@@ -23,7 +23,7 @@ internal sealed class ConversionPipeline(
         var results = new List<ConversionResult>();
 
         var reservedPaths = assets
-            .Where(asset => !WillConvert(asset))
+            .Where(asset => asset.Type != AssetType.Other && !WillConvert(asset))
             .Select(asset => FileSystemService.GetOutputPath(
                 options.OutputDirectory,
                 asset.RelativePath))
@@ -38,6 +38,16 @@ internal sealed class ConversionPipeline(
                 var outputRelative = Path.ChangeExtension(asset.RelativePath, outputExtension);
                 var outputPath = GetUniqueOutputPath(outputRelative, reservedPaths);
                 jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
+                continue;
+            }
+
+            if (asset.Type == AssetType.Other)
+            {
+                results.Add(new ConversionResult(
+                    asset.RelativePath,
+                    [],
+                    ConversionStatus.Skipped,
+                    "Unsupported file type; omitted from asset-only output."));
                 continue;
             }
 

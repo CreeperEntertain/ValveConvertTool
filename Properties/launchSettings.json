@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ValveConvertTool": {
+      "commandName": "Project",
+      "commandLineArgs": "--input \"D:\\_PORTAL_ARCHIVE_RAW\" --output \"D:\\_PORTAL_ARCHIVE_EXTRACT\" --blender \"C:\\Program Files\\Blender Foundation\\Blender 5.0\\blender.exe\""
+    }
+  }
+}
