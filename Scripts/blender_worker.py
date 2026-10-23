@@ -280,7 +280,7 @@ def validate_obj_textures(output_path):
     )
 
 
-def import_model(input_root, input_path, output_path):
+def import_model(input_root, input_path, output_path, output_root):
     ensure_parent(output_path)
 
     model_directory = os.path.dirname(os.path.abspath(input_path))
@@ -453,6 +453,26 @@ def remove_failed_outputs(asset_type, output_path):
             print(f"Warning: could not remove failed output {path}: {exc}", flush=True)
 
 
+def ensure_sourceio_registered():
+    if hasattr(bpy.types.Scene, "sourceio_props"):
+        return
+
+    print(
+        "[startup] Registering SourceIO Blender operators and properties...",
+        flush=True,
+    )
+
+    from SourceIO.blender_bindings.bindings import register as register_sourceio
+
+    register_sourceio()
+
+    if not hasattr(bpy.types.Scene, "sourceio_props"):
+        raise RuntimeError(
+            "SourceIO registration finished without registering "
+            "bpy.types.Scene.sourceio_props."
+        )
+
+
 def main():
     if "--" not in sys.argv:
         raise RuntimeError("Expected a manifest path after '--'.")
@@ -464,6 +484,8 @@ def main():
     input_root = os.path.abspath(manifest["input_root"])
     output_root = os.path.abspath(manifest["output_root"])
     jobs = manifest["jobs"]
+    if jobs:
+        ensure_sourceio_registered()
     results = []
 
     for job in jobs:
