@@ -91,15 +91,99 @@ def pack_used_images():
 
 
 def scan_source_content(input_root):
-    """Discover game content and persist its mounts for SourceIO import operators."""
+    """
+    Mount extracted loose files and readable VPK archives without invoking
+    SourceIO's game detectors or opening gameinfo.txt.
+    """
     from SourceIO.library.shared.content_manager import ContentManager
+    from SourceIO.library.shared.content_manager.providers import register_provider
+    from SourceIO.library.shared.content_manager.providers.loose_files import (
+        LooseFilesContentProvider,
+    )
+    from SourceIO.library.shared.content_manager.providers.vpk_provider import (
+        VPKContentProvider,
+    )
     from SourceIO.library.utils.tiny_path import TinyPath
-    from SourceIO.blender_bindings.utils.resource_utils import serialize_mounted_content
+    from SourceIO.blender_bindings.utils.resource_utils import (
+        serialize_mounted_content,
+    )
+
+    root = os.path.abspath(input_root)
+
+    if not os.path.isdir(root):
+        raise RuntimeError(
+            f"Cannot mount SourceIO content because the input root "
+            f"is not a directory: {root}"
+        )
 
     content_manager = ContentManager()
-    content_manager.scan_for_content(TinyPath(input_root))
+
+    content_manager.clean()
+
+    loose_provider = LooseFilesContentProvider(TinyPath(root))
+    content_manager.add_child(register_provider(loose_provider))
+
+    mounted_vpk_count = 0
+    unreadable_vpks = []
+    walk_errors = []
+
+    vpk_signature = b"\x34\x12\xAA\x55"
+
+    for directory, _, filenames in os.walk(
+        root,
+        onerror=walk_errors.append,
+    ):
+        for filename in filenames:
+            if not filename.casefold().endswith(".vpk"):
+                continue
+
+            archive_path = os.path.join(directory, filename)
+
+            try:
+                with open(archive_path, "rb") as archive_file:
+                    signature = archive_file.read(4)
+            except OSError as exc:
+                if len(unreadable_vpks) < 5:
+                    unreadable_vpks.append((archive_path, str(exc)))
+                continue
+
+            if signature != vpk_signature:
+                continue
+
+            try:
+                provider = VPKContentProvider(TinyPath(archive_path))
+                content_manager.add_child(register_provider(provider))
+                mounted_vpk_count += 1
+            except Exception as exc:
+                if len(unreadable_vpks) < 5:
+                    unreadable_vpks.append((archive_path, str(exc)))
 
     serialize_mounted_content(content_manager)
+
+    print(
+        f"[startup] SourceIO content mounted directly: "
+        f"root={root}; VPK archives={mounted_vpk_count}",
+        flush=True,
+    )
+
+    if walk_errors:
+        print(
+            f"[startup] Warning: {len(walk_errors)} directory scan error(s) "
+            f"occurred while locating VPK archives.",
+            flush=True,
+        )
+
+    if unreadable_vpks:
+        print(
+            f"[startup] Warning: some VPK archives could not be mounted "
+            f"(showing up to {len(unreadable_vpks)}):",
+            flush=True,
+        )
+        for archive_path, error in unreadable_vpks:
+            print(
+                f"[startup] Skipped VPK: {archive_path}: {error}",
+                flush=True,
+            )
 
 
 def import_vtf(input_root, input_path, output_path):
@@ -304,7 +388,7 @@ def import_model(input_root, input_path, output_path, output_root):
     bpy.ops.sourceio.mdl(
         directory=model_directory,
         files=[{"name": os.path.basename(input_path)}],
-        discover_resources=True,
+        discover_resources=False,
         import_textures=True,
         import_animations=False,
     )
@@ -433,7 +517,7 @@ def import_bsp(input_root, input_path, output_path, output_root):
     
     bpy.ops.sourceio.bsp(
         filepath=input_path,
-        discover_resources=True,
+        discover_resources=False,
         import_textures=True,
         use_bvlg=False,
     )
@@ -713,6 +797,14 @@ def main():
     if jobs:
         ensure_sourceio_registered()
         sourceio_registered = True
+
+        needs_source_content = any(
+            job.get("type", job.get("Type")) in ("model", "map")
+            for job in jobs
+        )
+
+        if needs_source_content:
+            scan_source_content(input_root)
 
     results = []
 
