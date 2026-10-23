@@ -54,17 +54,34 @@ internal sealed class AssetScanner
             throw new DirectoryNotFoundException(root);
 
         var assets = new List<AssetFile>();
+        var lastScanProgress = DateTime.MinValue;
 
-        foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        foreach (var path in Directory.EnumerateFiles(
+            root,
+            "*",
+            SearchOption.AllDirectories))
         {
             var relativePath = Path.GetRelativePath(root, path);
-            ConsoleReporter.Progress("SCAN", relativePath);
 
             assets.Add(new AssetFile(
                 path,
                 relativePath,
                 Classify(Path.GetExtension(path))));
+
+            var now = DateTime.UtcNow;
+            if (assets.Count == 1 || now - lastScanProgress >= TimeSpan.FromSeconds(5))
+            {
+                ConsoleReporter.Progress(
+                    "SCAN",
+                    $"{assets.Count:N0} files discovered");
+
+                lastScanProgress = now;
+            }
         }
+
+        ConsoleReporter.Progress(
+            "SCAN",
+            $"Scan complete: {assets.Count:N0} files discovered");
 
         ConsoleReporter.Complete();
 

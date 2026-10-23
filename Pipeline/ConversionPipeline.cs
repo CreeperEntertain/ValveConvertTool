@@ -37,13 +37,28 @@ internal sealed class ConversionPipeline(
         CleanOutputDirectory(outputRoot, reportPath, expectedOutputs);
 
         var processedAssetCount = 0;
+        var audioAssetCount = assets.Count(asset => asset.Type == AssetType.Audio);
+        var processedAudioCount = 0;
+        var copiedAudioCount = 0;
+        var lastCheckProgress = DateTime.MinValue;
 
         foreach (var asset in assets)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             processedAssetCount++;
-            ConsoleReporter.Progress("CHECK", $"{processedAssetCount}/{assets.Count}: {asset.RelativePath}");
+
+            var now = DateTime.UtcNow;
+            if (processedAssetCount == 1 || now - lastCheckProgress >= TimeSpan.FromSeconds(5))
+            {
+                ConsoleReporter.Progress(
+                    "CHECK",
+                    $"Checking {processedAssetCount:N0}/{assets.Count:N0} files; " +
+                    $"audio {processedAudioCount:N0}/{audioAssetCount:N0} processed, " +
+                    $"{copiedAudioCount:N0} copied");
+
+                lastCheckProgress = now;
+            }
 
             if (TryGetConversion(asset, out var jobType, out var outputExtension))
             {
@@ -73,19 +88,43 @@ internal sealed class ConversionPipeline(
 
             if (asset.Type == AssetType.Audio)
             {
+                processedAudioCount++;
+
                 var destination = FileSystemService.GetOutputPath(outputRoot, asset.RelativePath);
+
                 if (IsNonEmptyFile(destination))
-                {
                     results.Add(new ConversionResult(
-                        asset.RelativePath, [destination], ConversionStatus.Skipped,
+                        asset.RelativePath,
+                        [destination],
+                        ConversionStatus.Skipped,
                         "Audio file already exists; copy skipped."));
-                    continue;
+                else
+                {
+                    await fileSystem.CopyAsync(
+                        asset.FullPath,
+                        destination,
+                        cancellationToken);
+
+                    copiedAudioCount++;
+
+                    results.Add(new ConversionResult(
+                        asset.RelativePath,
+                        [destination],
+                        ConversionStatus.Copied));
                 }
 
-                ConsoleReporter.Progress("COPY", $"Copying {asset.RelativePath}");
-                await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
-                ConsoleReporter.Progress("COPY", $"Copied {asset.RelativePath}");
-                results.Add(new ConversionResult(asset.RelativePath, [destination], ConversionStatus.Copied));
+                now = DateTime.UtcNow;
+                if (now - lastCheckProgress >= TimeSpan.FromSeconds(5))
+                {
+                    ConsoleReporter.Progress(
+                        "CHECK",
+                        $"Checking {processedAssetCount:N0}/{assets.Count:N0} files; " +
+                        $"audio {processedAudioCount:N0}/{audioAssetCount:N0} processed, " +
+                        $"{copiedAudioCount:N0} copied");
+
+                    lastCheckProgress = now;
+                }
+
                 continue;
             }
 
@@ -95,6 +134,12 @@ internal sealed class ConversionPipeline(
                 ConversionStatus.Skipped,
                 "Not an output asset in asset-only mode."));
         }
+
+        ConsoleReporter.Progress(
+            "CHECK",
+            $"Check complete: {processedAssetCount:N0}/{assets.Count:N0} files; " +
+            $"audio {processedAudioCount:N0}/{audioAssetCount:N0} processed, " +
+            $"{copiedAudioCount:N0} copied");
 
         ConsoleReporter.Complete();
         ConsoleReporter.Event("QUEUE", $"Prepared {jobs.Count} conversion job(s) from {assets.Count} files.");
@@ -118,7 +163,7 @@ internal sealed class ConversionPipeline(
 
         foreach (var result in results)
         {
-            if (result.Status == ConversionStatus.Skipped)
+            if (result.Status is ConversionStatus.Skipped or ConversionStatus.Copied)
                 continue;
             var relativeInputPath = Path.IsPathRooted(result.InputPath)
                 ? Path.GetRelativePath(inputRoot, result.InputPath)
