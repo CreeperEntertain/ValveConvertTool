@@ -38,6 +38,7 @@ internal class Program
         }
         catch (Exception ex)
         {
+            ConsoleReporter.Complete();
             Console.Error.WriteLine($"Error: {ex.Message}");
             Console.ReadKey();
             return 1;

@@ -20,7 +20,9 @@ internal sealed class ConversionPipeline(
 
         var inputRoot = Path.GetFullPath(options.InputDirectory);
         var outputRoot = Path.GetFullPath(options.OutputDirectory);
+        ConsoleReporter.Progress("OUTPUT", $"Preparing {outputRoot}");
         Directory.CreateDirectory(outputRoot);
+        ConsoleReporter.Complete();
         if (inputRoot.StartsWith(outputRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException(
                 "The input directory cannot be inside the output directory; output cleanup would be unsafe.");
@@ -45,6 +47,7 @@ internal sealed class ConversionPipeline(
 
                 if (asset.Type == AssetType.Texture && IsValidPng(outputPath))
                 {
+                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — valid PNG already exists");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [outputPath], ConversionStatus.Skipped,
                         "Valid output already exists; conversion skipped."));
@@ -52,6 +55,7 @@ internal sealed class ConversionPipeline(
                 }
                 if (asset.Type == AssetType.Model && IsValidObjWithMtl(outputPath, mtlPath))
                 {
+                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — valid OBJ and MTL already exist");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [outputPath, mtlPath], ConversionStatus.Skipped,
                         "OBJ geometry and its MTL already exist; conversion skipped."));
@@ -59,11 +63,14 @@ internal sealed class ConversionPipeline(
                 }
                 if (asset.Type == AssetType.Map && IsNonEmptyFile(outputPath))
                 {
+                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — BLEND output already exists");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [outputPath], ConversionStatus.Skipped,
                         "BLEND output for this explicit BSP already exists; conversion skipped."));
                     continue;
                 }
+
+                ConsoleReporter.Progress("QUEUE", $"{asset.Type}: {asset.RelativePath}");
 
                 jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
                 continue;
@@ -74,16 +81,21 @@ internal sealed class ConversionPipeline(
                 var destination = FileSystemService.GetOutputPath(outputRoot, asset.RelativePath);
                 if (IsNonEmptyFile(destination))
                 {
+                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — audio already copied");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [destination], ConversionStatus.Skipped,
                         "Audio file already exists; copy skipped."));
                     continue;
                 }
 
+                ConsoleReporter.Progress("COPY", $"Copying {asset.RelativePath}");
                 await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
+                ConsoleReporter.Progress("COPY", $"Copied {asset.RelativePath}");
                 results.Add(new ConversionResult(asset.RelativePath, [destination], ConversionStatus.Copied));
                 continue;
             }
+
+            ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — not an output asset in asset-only mode");
 
             results.Add(new ConversionResult(
                 asset.RelativePath,
@@ -92,12 +104,37 @@ internal sealed class ConversionPipeline(
                 "Not an output asset in asset-only mode."));
         }
 
+        ConsoleReporter.Complete();
+        ConsoleReporter.Event(
+            "BLENDER",
+            jobs.Count == 0
+                ? "No Blender conversion jobs queued."
+                : $"Starting {jobs.Count} conversion job(s)");
+
         results.AddRange(await blender.RunAsync(jobs, cancellationToken));
+
+        foreach (var result in results)
+        {
+            var relativeInputPath = Path.IsPathRooted(result.InputPath)
+                ? Path.GetRelativePath(inputRoot, result.InputPath)
+                : result.InputPath;
+            var details = result.Message
+                ?? string.Join(
+                    ", ",
+                    result.OutputPaths.Select(path => Path.GetRelativePath(outputRoot, path)));
+            ConsoleReporter.Progress(
+                $"RESULT-{result.Status.ToString().ToUpperInvariant()}",
+                $"{relativeInputPath}: {details}");
+        }
+
+        ConsoleReporter.Complete();
 
         await File.WriteAllTextAsync(
             reportPath,
             JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }),
             cancellationToken);
+
+        ConsoleReporter.Event("REPORT", reportPath);
 
         Console.WriteLine();
         Console.WriteLine($"Scanned: {assets.Count}");
@@ -152,14 +189,24 @@ internal sealed class ConversionPipeline(
             if (string.Equals(fullPath, reportPath, StringComparison.OrdinalIgnoreCase))
                 continue;
             if (!expectedOutputs.Contains(fullPath))
+            {
+                ConsoleReporter.Progress("DELETE", Path.GetRelativePath(outputRoot, fullPath));
                 File.Delete(fullPath);
+            }
         }
+        ConsoleReporter.Complete();
         foreach (var directory in Directory
-                     .EnumerateDirectories(outputRoot, "*", SearchOption.AllDirectories)
-                     .OrderByDescending(path => path.Length)
-                     .ToArray())
-            if (!Directory.EnumerateFileSystemEntries(directory).Any())
-                Directory.Delete(directory);
+             .EnumerateDirectories(outputRoot, "*", SearchOption.AllDirectories)
+             .OrderByDescending(path => path.Length)
+             .ToArray())
+        {
+            if (Directory.EnumerateFileSystemEntries(directory).Any())
+                continue;
+            ConsoleReporter.Progress("RMDIR", Path.GetRelativePath(outputRoot, directory));
+            Directory.Delete(directory);
+        }
+
+        ConsoleReporter.Complete();
     }
 
     private bool TryGetConversion(

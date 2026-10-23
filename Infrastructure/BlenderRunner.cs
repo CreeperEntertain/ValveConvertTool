@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using ValveConvertTool.Configuration;
 using ValveConvertTool.Core;
@@ -48,13 +49,16 @@ internal sealed class BlenderRunner(AppOptions options)
             using var process = new Process { StartInfo = startInfo };
             process.Start();
 
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            var stdoutTask = ReadOutputAsync(process.StandardOutput, "BLENDER", cancellationToken);
+            var stderrTask = ReadOutputAsync(process.StandardError, "BLENDER-ERROR", cancellationToken);
 
             await process.WaitForExitAsync(cancellationToken);
 
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
+
+            ConsoleReporter.Complete();
+            ConsoleReporter.Event("BLENDER", $"Process exited with code {process.ExitCode}");
 
             if (process.ExitCode != 0)
                 throw new InvalidOperationException(
@@ -77,6 +81,38 @@ internal sealed class BlenderRunner(AppOptions options)
             File.Delete(manifestPath);
             File.Delete(resultPath);
         }
+    }
+
+    private static async Task<string> ReadOutputAsync(
+        StreamReader reader,
+        string type,
+        CancellationToken cancellationToken)
+    {
+        var output = new StringBuilder();
+
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            output.AppendLine(line);
+
+            if (type == "BLENDER-ERROR")
+            {
+                ConsoleReporter.Event(type, line);
+                continue;
+            }
+
+            var progressType = type;
+
+            if (line.StartsWith("[", StringComparison.Ordinal))
+            {
+                var end = line.IndexOf(']');
+                if (end > 1)
+                    progressType = "CONVERT-" + line[1..end].ToUpperInvariant();
+            }
+
+            ConsoleReporter.Progress(progressType, line);
+        }
+
+        return output.ToString();
     }
 }
 
