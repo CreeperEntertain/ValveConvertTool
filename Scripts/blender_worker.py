@@ -458,7 +458,22 @@ def ensure_sourceio_registered():
         return
 
     import importlib
-    import importlib.util
+
+    if "sourceio_module" not in locals() or sourceio_module is None:
+        raise RuntimeError(
+            "SourceIO's package loader did not leave a sourceio_module "
+            "available before importing bindings."
+        )
+
+    sourceio_module.__path__ = [addon_root]
+    sourceio_module.__package__ = "SourceIO"
+    sys.modules["SourceIO"] = sourceio_module
+
+    print(
+        f"[startup] Registered SourceIO package: "
+        f"{sys.modules['SourceIO'].__path__[0]}",
+        flush=True,
+    )
 
     bindings_module = importlib.import_module(
         "SourceIO.blender_bindings.bindings"
