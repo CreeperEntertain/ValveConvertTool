@@ -457,20 +457,99 @@ def ensure_sourceio_registered():
     if hasattr(bpy.types.Scene, "sourceio_props"):
         return
 
+    import importlib.util
+
     print(
-        "[startup] Registering SourceIO Blender operators and properties...",
+        "[startup] Locating the installed SourceIO add-on...",
         flush=True,
     )
 
-    from SourceIO.blender_bindings.bindings import register as register_sourceio
+    addon_dirs = list(bpy.utils.script_paths("addons"))
+    user_addons_dir = bpy.utils.user_resource(
+        "SCRIPTS",
+        path="addons",
+    )
+
+    if user_addons_dir:
+        addon_dirs.insert(0, user_addons_dir)
+
+    addon_root = None
+    searched_dirs = []
+
+    for addons_dir in dict.fromkeys(addon_dirs):
+        searched_dirs.append(addons_dir)
+
+        if not os.path.isdir(addons_dir):
+            continue
+
+        try:
+            entries = list(os.scandir(addons_dir))
+        except OSError:
+            continue
+
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if "sourceio" not in entry.name.casefold():
+                continue
+
+            candidate = entry.path
+
+            if (
+                os.path.isfile(os.path.join(candidate, "__init__.py"))
+                and os.path.isfile(
+                    os.path.join(
+                        candidate,
+                        "blender_bindings",
+                        "bindings.py",
+                    )
+                )
+            ):
+                addon_root = candidate
+                break
+
+        if addon_root is not None:
+            break
+
+    if addon_root is None:
+        raise RuntimeError(
+            "Could not locate SourceIO's add-on folder. "
+            "Searched: " + "; ".join(searched_dirs)
+        )
+
+    init_path = os.path.join(addon_root, "__init__.py")
+
+    print(f"[startup] Loading SourceIO from: {addon_root}", flush=True)
+
+    spec = importlib.util.spec_from_file_location(
+        "SourceIO",
+        init_path,
+        submodule_search_locations=[addon_root],
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Could not create a Python module spec for: {init_path}"
+        )
+
+    sourceio_module = importlib.util.module_from_spec(spec)
+    sys.modules["SourceIO"] = sourceio_module
+
+    spec.loader.exec_module(sourceio_module)
+
+    from SourceIO.blender_bindings.bindings import (
+        register as register_sourceio,
+    )
 
     register_sourceio()
 
     if not hasattr(bpy.types.Scene, "sourceio_props"):
         raise RuntimeError(
-            "SourceIO registration finished without registering "
+            "SourceIO registration returned without registering "
             "bpy.types.Scene.sourceio_props."
         )
+
+    print("[startup] SourceIO registered successfully.", flush=True)
 
 
 def main():
