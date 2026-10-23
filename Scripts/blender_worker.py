@@ -457,102 +457,8 @@ def ensure_sourceio_registered():
     if hasattr(bpy.types.Scene, "sourceio_props"):
         return
 
-    import importlib.util
-
-    print(
-        "[startup] Locating the installed SourceIO add-on...",
-        flush=True,
-    )
-
-    addon_dirs = list(bpy.utils.script_paths(subdir="addons"))
-    user_addons_dir = bpy.utils.user_resource(
-        "SCRIPTS",
-        path="addons",
-    )
-
-    if user_addons_dir:
-        addon_dirs.insert(0, user_addons_dir)
-
-    addon_root = None
-    searched_dirs = []
-
-    for addons_dir in dict.fromkeys(addon_dirs):
-        searched_dirs.append(addons_dir)
-
-        if not os.path.isdir(addons_dir):
-            continue
-
-        try:
-            entries = list(os.scandir(addons_dir))
-        except OSError:
-            continue
-
-        for entry in entries:
-            if not entry.is_dir():
-                continue
-            if "sourceio" not in entry.name.casefold():
-                continue
-
-            candidate = entry.path
-
-            if (
-                os.path.isfile(os.path.join(candidate, "__init__.py"))
-                and os.path.isfile(
-                    os.path.join(
-                        candidate,
-                        "blender_bindings",
-                        "bindings.py",
-                    )
-                )
-            ):
-                addon_root = candidate
-                break
-
-        if addon_root is not None:
-            break
-
-    if addon_root is None:
-        raise RuntimeError(
-            "Could not locate SourceIO's add-on folder. "
-            "Searched: " + "; ".join(searched_dirs)
-        )
-
-    stale_modules = [
-        name for name in tuple(sys.modules)
-        if name == "SourceIO" or name.startswith("SourceIO.")
-    ]
-
-    if stale_modules:
-        print(
-            "[startup] Clearing cached SourceIO modules: "
-            + ", ".join(stale_modules),
-            flush=True,
-        )
-
-    for name in stale_modules:
-        sys.modules.pop(name, None)
-
-    init_path = os.path.join(addon_root, "__init__.py")
-
-    print(f"[startup] Loading SourceIO from: {addon_root}", flush=True)
-
-    spec = importlib.util.spec_from_file_location(
-        "SourceIO",
-        init_path,
-        submodule_search_locations=[addon_root],
-    )
-
-    if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"Could not create a Python module spec for: {init_path}"
-        )
-
-    sourceio_module = importlib.util.module_from_spec(spec)
-    sys.modules["SourceIO"] = sourceio_module
-
-    spec.loader.exec_module(sourceio_module)
-
     import importlib
+    import importlib.util
 
     bindings_module = importlib.import_module(
         "SourceIO.blender_bindings.bindings"
@@ -560,6 +466,8 @@ def ensure_sourceio_registered():
     attributes_module = importlib.import_module(
         "SourceIO.blender_bindings.attributes"
     )
+
+    attributes_path = attributes_module.__file__
 
     print(
         f"[startup] SourceIO package: {sourceio_module.__file__}",
@@ -570,22 +478,50 @@ def ensure_sourceio_registered():
         flush=True,
     )
     print(
-        f"[startup] SourceIO attributes: {attributes_module.__file__}",
-        flush=True,
-    )
-    print(
-        "[startup] SourceIO_PG_props available: "
-        f"{hasattr(attributes_module, 'SourceIO_PG_props')}",
+        f"[startup] SourceIO attributes: {attributes_path}",
         flush=True,
     )
 
     if not hasattr(attributes_module, "SourceIO_PG_props"):
-        raise RuntimeError(
-            "SourceIO_PG_props is missing from the loaded attributes module: "
-            f"{attributes_module.__file__}"
+        print(
+            "[startup] SourceIO_PG_props is missing; "
+            "forcing a fresh source reload...",
+            flush=True,
         )
 
-    print("[startup] Calling SourceIO.register()...", flush=True)
+        importlib.invalidate_caches()
+
+        try:
+            cached_path = importlib.util.cache_from_source(attributes_path)
+            if os.path.isfile(cached_path):
+                os.remove(cached_path)
+                print(
+                    f"[startup] Removed stale bytecode: {cached_path}",
+                    flush=True,
+                )
+        except (OSError, NotImplementedError) as exc:
+            print(
+                f"[startup] Could not remove bytecode cache: {exc}",
+                flush=True,
+            )
+
+        attributes_module = importlib.reload(attributes_module)
+
+    if not hasattr(attributes_module, "SourceIO_PG_props"):
+        raise RuntimeError(
+            "SourceIO_PG_props is still missing after reloading the "
+            "installed source file. "
+            f"File: {attributes_path}. "
+            "The module's executed contents do not match the upstream "
+            "SourceIO attributes module."
+        )
+
+    print(
+        "[startup] SourceIO_PG_props is available; "
+        "calling SourceIO.register()...",
+        flush=True,
+    )
+
     bindings_module.register()
 
     if not hasattr(bpy.types.Scene, "sourceio_props"):
@@ -593,7 +529,7 @@ def ensure_sourceio_registered():
             "SourceIO.register() returned without creating "
             "Scene.sourceio_props. "
             f"Bindings: {bindings_module.__file__}; "
-            f"attributes: {attributes_module.__file__}"
+            f"attributes: {attributes_path}"
         )
 
     print(
