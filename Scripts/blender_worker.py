@@ -464,7 +464,7 @@ def ensure_sourceio_registered():
         flush=True,
     )
 
-    addon_dirs = list(bpy.utils.script_paths("addons"))
+    addon_dirs = list(bpy.utils.script_paths(subdir="addons"))
     user_addons_dir = bpy.utils.user_resource(
         "SCRIPTS",
         path="addons",
