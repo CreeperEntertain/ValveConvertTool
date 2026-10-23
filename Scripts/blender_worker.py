@@ -543,18 +543,57 @@ def ensure_sourceio_registered():
 
     register_sourceio()
 
+    from bpy.props import CollectionProperty, PointerProperty
+    from SourceIO.blender_bindings.attributes import SourceIO_PG_props
+    from SourceIO.blender_bindings.operators.flex_operators import (
+        SourceIO_PG_FlexController,
+    )
+    from SourceIO.blender_bindings.operators.shared_operators import (
+        SOURCEIO_UL_MountedResource,
+    )
+
+    def register_class_if_needed(cls):
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError as exc:
+            if "already registered as a subclass" not in str(exc):
+                raise
+
+    register_class_if_needed(SOURCEIO_UL_MountedResource)
+    register_class_if_needed(SourceIO_PG_FlexController)
+    register_class_if_needed(SourceIO_PG_props)
+
+    if not hasattr(bpy.types.Scene, "sourceio_props"):
+        bpy.types.Scene.sourceio_props = PointerProperty(
+            type=SourceIO_PG_props,
+        )
+        print(
+            "[startup] Attached missing Scene.sourceio_props property.",
+            flush=True,
+        )
+
+    if not hasattr(bpy.types.Object, "flex_controllers"):
+        bpy.types.Object.flex_controllers = CollectionProperty(
+            type=SourceIO_PG_FlexController,
+        )
+        print(
+            "[startup] Attached missing Object.flex_controllers property.",
+            flush=True,
+        )
+
     try:
         scene_props = bpy.context.scene.sourceio_props
     except (AttributeError, RuntimeError) as exc:
         raise RuntimeError(
-            "SourceIO register() returned, but the active scene "
-            "does not expose sourceio_props."
+            "SourceIO properties are still unavailable after explicit setup."
         ) from exc
 
     if scene_props is None:
-        raise RuntimeError("SourceIO sourceio_props is None on the active scene.")
+        raise RuntimeError(
+            "Scene.sourceio_props exists but returned None."
+        )
 
-    print("[startup] SourceIO registered successfully.", flush=True)
+    print("[startup] SourceIO properties are ready.", flush=True)
 
 
 def main():
