@@ -408,5 +408,5 @@ def main():
         json.dump(results, file, indent=2)
 
 
-if __name__ = "__main__":
+if __name__ == "__main__":
     main()
