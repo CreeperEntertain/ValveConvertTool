@@ -3,10 +3,11 @@
 internal enum AssetType
 {
     Texture,
+    Material,
     Model,
     ModelCompanion,
     Map,
     Audio,
     SourceDocument,
-    Unsupported
+    Other
 }

@@ -15,19 +15,17 @@ internal sealed class BlenderRunner(AppOptions options)
             return [];
 
         var manifestPath = Path.Combine(Path.GetTempPath(), $"valveconvert-{Guid.NewGuid():N}.json");
+        var resultPath = Path.ChangeExtension(manifestPath, ".results.json");
 
         try
         {
-            await File.WriteAllTextAsync(
-                manifestPath,
-                JsonSerializer.Serialize(new
-                {
-                    input_root = Path.GetFullPath(options.InputDirectory),
-                    steam_app_id = options.SteamAppId,
-                    jobs
-                }),
-                cancellationToken);
+            var manifest = new
+            {
+                input_root = Path.GetFullPath(options.InputDirectory),
+                jobs
+            };
 
+            await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest), cancellationToken);
             var workerPath = Path.Combine(AppContext.BaseDirectory, "Scripts", "blender_worker.py");
             if (!File.Exists(workerPath))
                 throw new FileNotFoundException("Blender worker script not found.", workerPath);
@@ -48,7 +46,6 @@ internal sealed class BlenderRunner(AppOptions options)
             startInfo.ArgumentList.Add(manifestPath);
 
             using var process = new Process { StartInfo = startInfo };
-
             process.Start();
 
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
@@ -58,14 +55,15 @@ internal sealed class BlenderRunner(AppOptions options)
 
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
+
             if (process.ExitCode != 0)
                 throw new InvalidOperationException(
                     $"Blender failed with exit code {process.ExitCode}.\n" +
                     $"STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-
-            var resultPath = Path.ChangeExtension(manifestPath, ".results.json");
             if (!File.Exists(resultPath))
-                throw new InvalidOperationException($"Blender completed without writing results.\n{stdout}\n{stderr}");
+                throw new InvalidOperationException(
+                    "Blender completed without writing results.\n" +
+                    $"STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
 
             return JsonSerializer.Deserialize<List<ConversionResult>>(
                 await File.ReadAllTextAsync(resultPath, cancellationToken),
@@ -77,7 +75,7 @@ internal sealed class BlenderRunner(AppOptions options)
         finally
         {
             File.Delete(manifestPath);
-            File.Delete(Path.ChangeExtension(manifestPath, ".results.json"));
+            File.Delete(resultPath);
         }
     }
 }

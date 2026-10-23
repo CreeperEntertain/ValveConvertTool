@@ -22,38 +22,35 @@ internal sealed class ConversionPipeline(
         var jobs = new List<AssetFileJob>();
         var results = new List<ConversionResult>();
 
+        var reservedPaths = assets
+            .Where(asset => !WillConvert(asset))
+            .Select(asset => FileSystemService.GetOutputPath(
+                options.OutputDirectory,
+                asset.RelativePath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         foreach (var asset in assets)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var outputRelative = asset.RelativePath;
-
-            switch (asset.Type)
+            if (TryGetConversion(asset, out var jobType, out var outputExtension))
             {
-                case AssetType.Texture when options.ConvertTextures:
-                    outputRelative = Path.ChangeExtension(asset.RelativePath, ".png");
-                    jobs.Add(CreateJob("texture", asset, outputRelative));
-                    break;
-                case AssetType.Model when options.ConvertModels:
-                    outputRelative = Path.ChangeExtension(asset.RelativePath, ".obj");
-                    jobs.Add(CreateJob("model", asset, outputRelative));
-                    break;
-                case AssetType.Map when options.ConvertMaps:
-                    outputRelative = Path.ChangeExtension(asset.RelativePath, ".blend");
-                    jobs.Add(CreateJob("map", asset, outputRelative));
-                    break;
-                case AssetType.Audio when options.CopyAudio:
-                case AssetType.SourceDocument:
-                    {
-                        var destination = FileSystemService.GetOutputPath(options.OutputDirectory, outputRelative);
-                        await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
-                        results.Add(new ConversionResult(asset.RelativePath, [destination], ConversionStatus.Copied));
-                        break;
-                    }
-                case AssetType.ModelCompanion:
-                    // MDL conversion, not outputs
-                    break;
+                var outputRelative = Path.ChangeExtension(asset.RelativePath, outputExtension);
+                var outputPath = GetUniqueOutputPath(outputRelative, reservedPaths);
+                jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
+                continue;
             }
+
+            var destination = FileSystemService.GetOutputPath(options.OutputDirectory, asset.RelativePath);
+            await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
+
+            results.Add(new ConversionResult(
+                asset.RelativePath,
+                [destination],
+                ConversionStatus.Copied,
+                asset.Type == AssetType.Other
+                    ? "No dedicated converter for this extension; preserved unchanged."
+                    : null));
         }
 
         results.AddRange(await blender.RunAsync(jobs, cancellationToken));
@@ -72,9 +69,67 @@ internal sealed class ConversionPipeline(
         Console.WriteLine($"Report: {reportPath}");
     }
 
-    private AssetFileJob CreateJob(string type, AssetFile asset, string relativeOutput)
-        => new AssetFileJob(
-            type,
-            Path.GetFullPath(asset.FullPath),
-            FileSystemService.GetOutputPath(options.OutputDirectory, relativeOutput));
+    private bool WillConvert(AssetFile asset)
+        => asset.Type switch
+        {
+            AssetType.Texture => options.ConvertTextures,
+            AssetType.Material => options.ConvertMaterials,
+            AssetType.Model => options.ConvertModels,
+            AssetType.Map => options.ConvertMaps,
+            _ => false
+        };
+
+    private bool TryGetConversion(
+        AssetFile asset,
+        out string? jobType,
+        out string? outputExtension)
+    {
+        jobType = null;
+        outputExtension = null;
+
+        switch (asset.Type)
+        {
+            case AssetType.Texture when options.ConvertTextures:
+                jobType = "texture";
+                outputExtension = ".png";
+                return true;
+            case AssetType.Material when options.ConvertMaterials:
+                jobType = "material";
+                outputExtension = ".blend";
+                return true;
+            case AssetType.Model when options.ConvertModels:
+                jobType = "model";
+                outputExtension = ".obj";
+                return true;
+            case AssetType.Map when options.ConvertMaps:
+                jobType = "map";
+                outputExtension = ".blend";
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private string GetUniqueOutputPath(
+        string relativePath,
+        HashSet<string> reservedPaths)
+    {
+        var candidate = FileSystemService.GetOutputPath(options.OutputDirectory, relativePath);
+        if (reservedPaths.Add(candidate))
+            return candidate;
+
+        var directory = Path.GetDirectoryName(relativePath);
+        var stem = Path.GetFileNameWithoutExtension(relativePath);
+        var extension = Path.GetExtension(relativePath);
+
+        for (var index = 1; ; index++)
+        {
+            var fileName = $"{stem}.converted{index}{extension}";
+            var alternateRelative = string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+
+            candidate = FileSystemService.GetOutputPath(options.OutputDirectory, alternateRelative);
+            if (reservedPaths.Add(candidate))
+                return candidate;
+        }
+    }
 }

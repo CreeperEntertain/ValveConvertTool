@@ -22,10 +22,7 @@ internal class Program
             {
                 InputDirectory = Required(values, "input"),
                 OutputDirectory = Required(values, "output"),
-                BlenderExecutable = Required(values, "blender"),
-                SteamAppId = int.TryParse(
-                    values.GetValueOrDefault("steam-app-id", "400"),
-                    out var appId) ? appId : 400
+                BlenderExecutable = Required(values, "blender")
             };
 
             FileSystemService.ValidateDirectories(options.InputDirectory, options.OutputDirectory);
@@ -50,23 +47,26 @@ internal class Program
     private static Dictionary<string, string> ParseArguments(string[] args)
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var allowed = new HashSet<string>(["input", "output", "blender"], StringComparer.OrdinalIgnoreCase);
 
         for (var i = 0; i < args.Length; i++)
         {
-            var key = args[i].TrimStart('-');
-            if (key.Equals("help", StringComparison.OrdinalIgnoreCase))
+            var argument = args[i];
+            if (argument is "--help" or "-h")
             {
                 values["help"] = "";
                 continue;
             }
-            if (!key.Equals(args[i], StringComparison.Ordinal) || args[i].StartsWith('-'))
-            {
-                if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
-                    throw new ArgumentException($"Missing value for argument: {args[i]}");
-                values[key] = args[++i];
-            }
-            else
-                throw new ArgumentException($"Unexpected argument: {args[i]}");
+            if (!argument.StartsWith("--", StringComparison.Ordinal))
+                throw new ArgumentException($"Unexpected argument: {argument}");
+
+            var key = argument[2..];
+            if (!allowed.Contains(key))
+                throw new ArgumentException($"Unknown argument: {argument}");
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                throw new ArgumentException($"Missing value for argument: {argument}");
+
+            values[key] = args[++i];
         }
 
         return values;
@@ -82,18 +82,17 @@ internal class Program
     private static void PrintHelp()
     {
         Console.WriteLine("""
-            ValveConvertTool — Portal 1 asset converter
+            ValveConvertTool — Source Engine asset converter
 
             Usage:
-              ValveConvertTool --input <folder> --output <folder>
+              ValveConvertTool --input <folder>
+                               --output <folder>
                                --blender <blender.exe>
-                               [--steam-app-id 400]
 
-            Examples:
-              ValveConvertTool --input "D:\PortalExtracted"
-                               --output "D:\PortalConverted"
+            Example:
+              ValveConvertTool --input "D:\SourceAssets"
+                               --output "D:\ConvertedAssets"
                                --blender "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
-                               --steam-app-id 400
             """);
     }
 }
