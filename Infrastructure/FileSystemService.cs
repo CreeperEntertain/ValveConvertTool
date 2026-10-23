@@ -6,8 +6,8 @@ internal sealed class FileSystemService
         => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
     public static void ValidateDirectories(
-        string inputDirectory,
-        string outputDirectory)
+    string inputDirectory,
+    string outputDirectory)
     {
         var input = NormalizeDirectory(inputDirectory);
         var output = NormalizeDirectory(outputDirectory);
@@ -15,11 +15,14 @@ internal sealed class FileSystemService
             throw new InvalidOperationException("Input and output directories must be different.");
         if (output.StartsWith(input + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Output cannot be inside the input directory.");
+        if (input.StartsWith(output + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                "Input cannot be inside the output directory; output cleanup would be unsafe.");
     }
 
     public static string GetOutputPath(
-        string outputRoot,
-        string relativePath)
+    string outputRoot,
+    string relativePath)
     {
         var root = Path.GetFullPath(outputRoot);
         var destination = Path.GetFullPath(Path.Combine(root, relativePath));
@@ -30,9 +33,9 @@ internal sealed class FileSystemService
     }
 
     public async Task CopyAsync(
-        string sourcePath,
-        string destinationPath,
-        CancellationToken cancellationToken = default)
+    string sourcePath,
+    string destinationPath,
+    CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
 

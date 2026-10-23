@@ -12,22 +12,26 @@ internal sealed class ConversionPipeline(
     FileSystemService fileSystem,
     BlenderRunner blender)
 {
+    private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         FileSystemService.ValidateDirectories(options.InputDirectory, options.OutputDirectory);
 
-        Directory.CreateDirectory(options.OutputDirectory);
+        var inputRoot = Path.GetFullPath(options.InputDirectory);
+        var outputRoot = Path.GetFullPath(options.OutputDirectory);
+        Directory.CreateDirectory(outputRoot);
+        if (inputRoot.StartsWith(outputRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                "The input directory cannot be inside the output directory; output cleanup would be unsafe.");
 
-        var assets = scanner.Scan(options.InputDirectory);
+        var assets = scanner.Scan(inputRoot);
         var jobs = new List<AssetFileJob>();
         var results = new List<ConversionResult>();
+        var reportPath = Path.Combine(outputRoot, "conversion-report.json");
 
-        var reservedPaths = assets
-            .Where(asset => asset.Type != AssetType.Other && !WillConvert(asset))
-            .Select(asset => FileSystemService.GetOutputPath(
-                options.OutputDirectory,
-                asset.RelativePath))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var expectedOutputs = BuildExpectedOutputs(assets, outputRoot);
+        CleanOutputDirectory(outputRoot, reportPath, expectedOutputs);
 
         foreach (var asset in assets)
         {
@@ -35,36 +39,61 @@ internal sealed class ConversionPipeline(
 
             if (TryGetConversion(asset, out var jobType, out var outputExtension))
             {
-                var outputRelative = Path.ChangeExtension(asset.RelativePath, outputExtension);
-                var outputPath = GetUniqueOutputPath(outputRelative, reservedPaths);
+                var outputRelative = Path.ChangeExtension(asset.RelativePath, outputExtension!);
+                var outputPath = FileSystemService.GetOutputPath(outputRoot, outputRelative);
+                var mtlPath = Path.ChangeExtension(outputPath, ".mtl");
+
+                if (asset.Type == AssetType.Texture && IsValidPng(outputPath))
+                {
+                    results.Add(new ConversionResult(
+                        asset.RelativePath, [outputPath], ConversionStatus.Skipped,
+                        "Valid output already exists; conversion skipped."));
+                    continue;
+                }
+                if (asset.Type == AssetType.Model && IsValidObjWithMtl(outputPath, mtlPath))
+                {
+                    results.Add(new ConversionResult(
+                        asset.RelativePath, [outputPath, mtlPath], ConversionStatus.Skipped,
+                        "OBJ geometry and its MTL already exist; conversion skipped."));
+                    continue;
+                }
+                if (asset.Type == AssetType.Map && IsNonEmptyFile(outputPath))
+                {
+                    results.Add(new ConversionResult(
+                        asset.RelativePath, [outputPath], ConversionStatus.Skipped,
+                        "BLEND output for this explicit BSP already exists; conversion skipped."));
+                    continue;
+                }
+
                 jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
                 continue;
             }
 
-            if (asset.Type == AssetType.Other)
+            if (asset.Type == AssetType.Audio)
             {
-                results.Add(new ConversionResult(
-                    asset.RelativePath,
-                    [],
-                    ConversionStatus.Skipped,
-                    "Unsupported file type; omitted from asset-only output."));
+                var destination = FileSystemService.GetOutputPath(outputRoot, asset.RelativePath);
+                if (IsNonEmptyFile(destination))
+                {
+                    results.Add(new ConversionResult(
+                        asset.RelativePath, [destination], ConversionStatus.Skipped,
+                        "Audio file already exists; copy skipped."));
+                    continue;
+                }
+
+                await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
+                results.Add(new ConversionResult(asset.RelativePath, [destination], ConversionStatus.Copied));
                 continue;
             }
 
-            var destination = FileSystemService.GetOutputPath(options.OutputDirectory, asset.RelativePath);
-            await fileSystem.CopyAsync(asset.FullPath, destination, cancellationToken);
-
             results.Add(new ConversionResult(
                 asset.RelativePath,
-                [destination],
-                ConversionStatus.Copied,
-                asset.Type == AssetType.Other
-                    ? "No dedicated converter for this extension; preserved unchanged."
-                    : null));
+                [],
+                ConversionStatus.Skipped,
+                "Not an output asset in asset-only mode."));
         }
 
         results.AddRange(await blender.RunAsync(jobs, cancellationToken));
-        var reportPath = Path.Combine(options.OutputDirectory, "conversion-report.json");
+
         await File.WriteAllTextAsync(
             reportPath,
             JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }),
@@ -74,20 +103,64 @@ internal sealed class ConversionPipeline(
         Console.WriteLine($"Scanned: {assets.Count}");
         Console.WriteLine($"Results: {results.Count}");
         Console.WriteLine($"Converted: {results.Count(r => r.Status == ConversionStatus.Converted)}");
-        Console.WriteLine($"Copied: {results.Count(r => r.Status == ConversionStatus.Copied)}");
+        Console.WriteLine($"Copied (audio): {results.Count(r => r.Status == ConversionStatus.Copied)}");
+        Console.WriteLine($"Skipped: {results.Count(r => r.Status == ConversionStatus.Skipped)}");
         Console.WriteLine($"Failed: {results.Count(r => r.Status == ConversionStatus.Failed)}");
         Console.WriteLine($"Report: {reportPath}");
     }
 
-    private bool WillConvert(AssetFile asset)
-        => asset.Type switch
+    private HashSet<string> BuildExpectedOutputs(
+        IReadOnlyList<AssetFile> assets,
+        string outputRoot)
+    {
+        var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void Add(string relativePath)
+            => expected.Add(FileSystemService.GetOutputPath(outputRoot, relativePath));
+
+        foreach (var asset in assets)
+            switch (asset.Type)
+            {
+                case AssetType.Texture when options.ConvertTextures:
+                    Add(Path.ChangeExtension(asset.RelativePath, ".png"));
+                    break;
+
+                case AssetType.Model when options.ConvertModels:
+                    var objRelative = Path.ChangeExtension(asset.RelativePath, ".obj");
+                    Add(objRelative);
+                    Add(Path.ChangeExtension(objRelative, ".mtl"));
+                    break;
+                case AssetType.Map when options.ConvertMaps:
+                    Add(Path.ChangeExtension(asset.RelativePath, ".blend"));
+                    break;
+                case AssetType.Audio:
+                    Add(asset.RelativePath);
+                    break;
+            }
+
+        return expected;
+    }
+
+    private static void CleanOutputDirectory(
+        string outputRoot,
+        string reportPath,
+        HashSet<string> expectedOutputs)
+    {
+        foreach (var file in Directory.EnumerateFiles(outputRoot, "*", SearchOption.AllDirectories).ToArray())
         {
-            AssetType.Texture => options.ConvertTextures,
-            AssetType.Material => options.ConvertMaterials,
-            AssetType.Model => options.ConvertModels,
-            AssetType.Map => options.ConvertMaps,
-            _ => false
-        };
+            var fullPath = Path.GetFullPath(file);
+            if (string.Equals(fullPath, reportPath, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!expectedOutputs.Contains(fullPath))
+                File.Delete(fullPath);
+        }
+        foreach (var directory in Directory
+                     .EnumerateDirectories(outputRoot, "*", SearchOption.AllDirectories)
+                     .OrderByDescending(path => path.Length)
+                     .ToArray())
+            if (!Directory.EnumerateFileSystemEntries(directory).Any())
+                Directory.Delete(directory);
+    }
 
     private bool TryGetConversion(
         AssetFile asset,
@@ -103,10 +176,6 @@ internal sealed class ConversionPipeline(
                 jobType = "texture";
                 outputExtension = ".png";
                 return true;
-            case AssetType.Material when options.ConvertMaterials:
-                jobType = "material";
-                outputExtension = ".blend";
-                return true;
             case AssetType.Model when options.ConvertModels:
                 jobType = "model";
                 outputExtension = ".obj";
@@ -120,26 +189,70 @@ internal sealed class ConversionPipeline(
         }
     }
 
-    private string GetUniqueOutputPath(
-        string relativePath,
-        HashSet<string> reservedPaths)
+    private static bool IsNonEmptyFile(string path)
     {
-        var candidate = FileSystemService.GetOutputPath(options.OutputDirectory, relativePath);
-        if (reservedPaths.Add(candidate))
-            return candidate;
-
-        var directory = Path.GetDirectoryName(relativePath);
-        var stem = Path.GetFileNameWithoutExtension(relativePath);
-        var extension = Path.GetExtension(relativePath);
-
-        for (var index = 1; ; index++)
+        try
         {
-            var fileName = $"{stem}.converted{index}{extension}";
-            var alternateRelative = string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
-
-            candidate = FileSystemService.GetOutputPath(options.OutputDirectory, alternateRelative);
-            if (reservedPaths.Add(candidate))
-                return candidate;
+            return File.Exists(path) && new FileInfo(path).Length > 0;
         }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsValidPng(string path)
+    {
+        if (!IsNonEmptyFile(path))
+            return false;
+
+        try
+        {
+            using var stream = File.OpenRead(path);
+            var signature = new byte[PngSignature.Length];
+            return stream.Read(signature, 0, signature.Length) == signature.Length
+                && signature.SequenceEqual(PngSignature);
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsValidObjWithMtl(string objPath, string mtlPath)
+    {
+        if (!IsNonEmptyFile(objPath) || !IsNonEmptyFile(mtlPath))
+            return false;
+
+        try
+        {
+            var hasVertex = false;
+            var hasFace = false;
+            foreach (var line in File.ReadLines(objPath))
+                if (line.StartsWith("v ", StringComparison.Ordinal))
+                    hasVertex = true;
+                else if (line.StartsWith("f ", StringComparison.Ordinal))
+                    hasFace = true;
+                if (hasVertex && hasFace)
+                    return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        return false;
     }
 }
