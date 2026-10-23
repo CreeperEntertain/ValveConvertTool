@@ -543,11 +543,16 @@ def ensure_sourceio_registered():
 
     register_sourceio()
 
-    if not hasattr(bpy.types.Scene, "sourceio_props"):
+    try:
+        scene_props = bpy.context.scene.sourceio_props
+    except (AttributeError, RuntimeError) as exc:
         raise RuntimeError(
-            "SourceIO registration returned without registering "
-            "bpy.types.Scene.sourceio_props."
-        )
+            "SourceIO register() returned, but the active scene "
+            "does not expose sourceio_props."
+        ) from exc
+
+    if scene_props is None:
+        raise RuntimeError("SourceIO sourceio_props is None on the active scene.")
 
     print("[startup] SourceIO registered successfully.", flush=True)
 
