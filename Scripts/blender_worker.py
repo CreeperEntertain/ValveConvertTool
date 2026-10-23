@@ -517,6 +517,21 @@ def ensure_sourceio_registered():
             "Searched: " + "; ".join(searched_dirs)
         )
 
+    stale_modules = [
+        name for name in tuple(sys.modules)
+        if name == "SourceIO" or name.startswith("SourceIO.")
+    ]
+
+    if stale_modules:
+        print(
+            "[startup] Clearing cached SourceIO modules: "
+            + ", ".join(stale_modules),
+            flush=True,
+        )
+
+    for name in stale_modules:
+        sys.modules.pop(name, None)
+
     init_path = os.path.join(addon_root, "__init__.py")
 
     print(f"[startup] Loading SourceIO from: {addon_root}", flush=True)
@@ -537,46 +552,54 @@ def ensure_sourceio_registered():
 
     spec.loader.exec_module(sourceio_module)
 
-    from SourceIO.blender_bindings.bindings import (
-        register as register_sourceio,
+    import importlib
+
+    bindings_module = importlib.import_module(
+        "SourceIO.blender_bindings.bindings"
+    )
+    attributes_module = importlib.import_module(
+        "SourceIO.blender_bindings.attributes"
     )
 
-    register_sourceio()
+    print(
+        f"[startup] SourceIO package: {sourceio_module.__file__}",
+        flush=True,
+    )
+    print(
+        f"[startup] SourceIO bindings: {bindings_module.__file__}",
+        flush=True,
+    )
+    print(
+        f"[startup] SourceIO attributes: {attributes_module.__file__}",
+        flush=True,
+    )
+    print(
+        "[startup] SourceIO_PG_props available: "
+        f"{hasattr(attributes_module, 'SourceIO_PG_props')}",
+        flush=True,
+    )
 
-    if not hasattr(bpy.types.Scene, "sourceio_props"):
-        print(
-            "[startup] Scene.sourceio_props is missing; "
-            "retrying SourceIO register_props()...",
-            flush=True,
+    if not hasattr(attributes_module, "SourceIO_PG_props"):
+        raise RuntimeError(
+            "SourceIO_PG_props is missing from the loaded attributes module: "
+            f"{attributes_module.__file__}"
         )
 
-        from SourceIO.blender_bindings.attributes import register_props
-
-        try:
-            register_props()
-        except ValueError as exc:
-            if "already registered as a subclass" not in str(exc):
-                raise
-
-            props_class = getattr(bpy.types, "SourceIO_PG_props", None)
-
-            if props_class is None:
-                raise RuntimeError(
-                    "SourceIO's property group is already registered, "
-                    "but bpy.types.SourceIO_PG_props cannot be found."
-                ) from exc
-
-            bpy.types.Scene.sourceio_props = bpy.props.PointerProperty(
-                type=props_class
-            )
+    print("[startup] Calling SourceIO.register()...", flush=True)
+    bindings_module.register()
 
     if not hasattr(bpy.types.Scene, "sourceio_props"):
         raise RuntimeError(
-            "SourceIO property registration failed: "
-            "Scene.sourceio_props is still missing."
+            "SourceIO.register() returned without creating "
+            "Scene.sourceio_props. "
+            f"Bindings: {bindings_module.__file__}; "
+            f"attributes: {attributes_module.__file__}"
         )
 
-    print("[startup] SourceIO Scene properties are ready.", flush=True)
+    print(
+        "[startup] SourceIO Scene properties are ready.",
+        flush=True,
+    )
 
     from bpy.props import CollectionProperty, PointerProperty
     from SourceIO.blender_bindings.attributes import SourceIO_PG_props
