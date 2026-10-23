@@ -36,9 +36,14 @@ internal sealed class ConversionPipeline(
         PreserveReferencedMtlTextures(outputRoot, expectedOutputs);
         CleanOutputDirectory(outputRoot, reportPath, expectedOutputs);
 
+        var processedAssetCount = 0;
+
         foreach (var asset in assets)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            processedAssetCount++;
+            ConsoleReporter.Progress("CHECK", $"{processedAssetCount}/{assets.Count}: {asset.RelativePath}");
 
             if (TryGetConversion(asset, out var jobType, out var outputExtension))
             {
@@ -60,8 +65,6 @@ internal sealed class ConversionPipeline(
                         "OBJ geometry and its MTL already exist; conversion skipped."));
                     continue;
                 }
-
-                ConsoleReporter.Progress("QUEUE", $"{asset.Type}: {asset.RelativePath}");
 
                 Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
                 jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
@@ -94,6 +97,7 @@ internal sealed class ConversionPipeline(
         }
 
         ConsoleReporter.Complete();
+        ConsoleReporter.Event("QUEUE", $"Prepared {jobs.Count} conversion job(s) from {assets.Count} files.");
         ConsoleReporter.Event(
             "BLENDER",
             jobs.Count == 0
