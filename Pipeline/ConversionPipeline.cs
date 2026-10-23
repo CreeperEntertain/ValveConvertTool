@@ -47,7 +47,6 @@ internal sealed class ConversionPipeline(
 
                 if (asset.Type == AssetType.Texture && IsValidPng(outputPath))
                 {
-                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — valid PNG already exists");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [outputPath], ConversionStatus.Skipped,
                         "Valid output already exists; conversion skipped."));
@@ -55,7 +54,6 @@ internal sealed class ConversionPipeline(
                 }
                 if (asset.Type == AssetType.Model && IsValidObjWithMtl(outputPath, mtlPath))
                 {
-                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — valid OBJ and MTL already exist");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [outputPath, mtlPath], ConversionStatus.Skipped,
                         "OBJ geometry and its MTL already exist; conversion skipped."));
@@ -73,7 +71,6 @@ internal sealed class ConversionPipeline(
                 var destination = FileSystemService.GetOutputPath(outputRoot, asset.RelativePath);
                 if (IsNonEmptyFile(destination))
                 {
-                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — audio already copied");
                     results.Add(new ConversionResult(
                         asset.RelativePath, [destination], ConversionStatus.Skipped,
                         "Audio file already exists; copy skipped."));
@@ -86,8 +83,6 @@ internal sealed class ConversionPipeline(
                 results.Add(new ConversionResult(asset.RelativePath, [destination], ConversionStatus.Copied));
                 continue;
             }
-
-            ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — not an output asset in asset-only mode");
 
             results.Add(new ConversionResult(
                 asset.RelativePath,
@@ -107,6 +102,8 @@ internal sealed class ConversionPipeline(
 
         foreach (var result in results)
         {
+            if (result.Status == ConversionStatus.Skipped)
+                continue;
             var relativeInputPath = Path.IsPathRooted(result.InputPath)
                 ? Path.GetRelativePath(inputRoot, result.InputPath)
                 : result.InputPath;
