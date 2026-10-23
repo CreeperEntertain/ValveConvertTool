@@ -23,6 +23,7 @@ internal sealed class BlenderRunner(AppOptions options)
             var manifest = new
             {
                 input_root = Path.GetFullPath(options.InputDirectory),
+                output_root = Path.GetFullPath(options.OutputDirectory),
                 jobs
             };
 

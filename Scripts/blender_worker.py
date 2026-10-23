@@ -47,6 +47,38 @@ def get_relative_input_path(input_root, input_path):
     return relative.replace("\\", "/")
 
 
+def get_texture_cache_path(input_root, input_path, output_root):
+    """Mirror the source game's materials folder in the output tree."""
+    from SourceIO.library.utils.path_utilities import get_mod_path
+    from SourceIO.library.utils.tiny_path import TinyPath
+
+    source_directory = os.path.dirname(os.path.abspath(input_path))
+    game_root = os.path.abspath(str(get_mod_path(TinyPath(source_directory))))
+
+    expected_game_dirs = ("materials", "maps", "models", "elements")
+    if (
+        not os.path.isdir(game_root)
+        or not any(
+            os.path.isdir(os.path.join(game_root, name))
+            for name in expected_game_dirs
+        )
+    ):
+        game_root = os.path.abspath(input_root)
+
+    try:
+        relative_game_root = os.path.relpath(game_root, os.path.abspath(input_root))
+    except ValueError:
+        relative_game_root = os.curdir
+
+    if (
+        relative_game_root == os.pardir
+        or relative_game_root.startswith(os.pardir + os.sep)
+    ):
+        relative_game_root = os.curdir
+
+    return os.path.abspath(os.path.join(output_root, relative_game_root, "materials"))
+
+
 def pack_used_images():
     for image in bpy.data.images:
         if image.users <= 0 or not image.has_data:
@@ -184,14 +216,84 @@ def ensure_obj_material_library(output_path):
         raise RuntimeError("OBJ export did not produce a non-empty MTL file.")
 
 
+def get_mtl_texture_path(line):
+    """Extract a texture filename from an MTL map directive."""
+    fields = line.strip().split()
+    if len(fields) < 2:
+        return None
+
+    index = 1
+    while index < len(fields) and fields[index].startswith("-"):
+        option = fields[index]
+
+        if option in ("-o", "-s"):
+            index += 4
+        elif option in (
+            "-bm", "-boost", "-texres", "-clamp",
+            "-blendu", "-blendv", "-imfchan", "-type",
+        ):
+            index += 2
+        else:
+            return None
+
+    if index >= len(fields):
+        return None
+
+    return " ".join(fields[index:]).strip().strip('"')
+
+
+def validate_obj_textures(output_path):
+    """Require at least one diffuse MTL reference that resolves to a real PNG."""
+    mtl_path = os.path.splitext(output_path)[0] + ".mtl"
+
+    if not os.path.isfile(mtl_path):
+        raise RuntimeError("Model export has no MTL material library.")
+
+    with open(mtl_path, "r", encoding="utf-8", errors="replace") as file:
+        for line in file:
+            fields = line.strip().split(None, 1)
+            if not fields or fields[0].casefold() != "map_kd":
+                continue
+
+            texture_reference = get_mtl_texture_path(line)
+            if not texture_reference:
+                continue
+
+            if not os.path.isabs(texture_reference):
+                texture_reference = os.path.join(os.path.dirname(mtl_path), texture_reference)
+
+            texture_path = os.path.abspath(texture_reference)
+            if not os.path.isfile(texture_path) or os.path.getsize(texture_path) == 0:
+                continue
+
+            with open(texture_path, "rb") as image_file:
+                if image_file.read(len(PNG_SIGNATURE)) == PNG_SIGNATURE:
+                    print(
+                        f"[model] Verified diffuse texture: {texture_path}",
+                        flush=True,
+                    )
+                    return
+
+    raise RuntimeError(
+        "Model geometry exported, but its MTL has no valid map_Kd PNG "
+        "reference. Texture import or material-to-image linking failed."
+    )
+
+
 def import_model(input_root, input_path, output_path):
     ensure_parent(output_path)
-    relative_path = get_relative_input_path(input_root, input_path)
 
-    scan_source_content(input_root)
+    model_directory = os.path.dirname(os.path.abspath(input_path))
+    texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
+    os.makedirs(texture_cache_path, exist_ok=True)
+
+    bpy.context.scene.sourceio_props.TextureCachePath = texture_cache_path
+
+    print(f"[model] SourceIO texture cache: {texture_cache_path}", flush=True)
+
     bpy.ops.sourceio.mdl(
-        directory=input_root,
-        files=[{"name": relative_path}],
+        directory=model_directory,
+        files=[{"name": os.path.basename(input_path)}],
         discover_resources=True,
         import_textures=True,
         import_animations=False,
@@ -222,6 +324,7 @@ def import_model(input_root, input_path, output_path):
         filepath=output_path,
         export_selected_objects=True,
         export_materials=True,
+        path_mode="RELATIVE",
     )
 
     if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
@@ -229,6 +332,7 @@ def import_model(input_root, input_path, output_path):
 
     validate_obj_geometry(output_path)
     ensure_obj_material_library(output_path)
+    validate_obj_textures(output_path)
 
 
 def node_tree_has_image_texture(node_tree, visited=None):
@@ -297,12 +401,16 @@ def validate_bsp_scene():
         )
 
 
-def import_bsp(input_root, input_path, output_path):
+def import_bsp(input_root, input_path, output_path, output_root):
     if os.path.splitext(input_path)[1].casefold() != ".bsp":
         raise ValueError("Only an explicit .bsp source may create a .blend output.")
 
     ensure_parent(output_path)
 
+    texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
+    os.makedirs(texture_cache_path, exist_ok=True)
+    bpy.context.scene.sourceio_props.TextureCachePath = texture_cache_path
+    
     bpy.ops.sourceio.bsp(
         filepath=input_path,
         discover_resources=True,
@@ -354,6 +462,7 @@ def main():
         manifest = json.load(file)
 
     input_root = os.path.abspath(manifest["input_root"])
+    output_root = os.path.abspath(manifest["output_root"])
     jobs = manifest["jobs"]
     results = []
 
@@ -375,9 +484,9 @@ def main():
             if asset_type == "texture":
                 import_vtf(input_root, input_path, output_path)
             elif asset_type == "model":
-                import_model(input_root, input_path, output_path)
+                import_model(input_root, input_path, output_path, output_root)
             elif asset_type == "map":
-                import_bsp(input_root, input_path, output_path)
+                import_bsp(input_root, input_path, output_path, output_root)
             else:
                 raise ValueError(f"Unsupported conversion job type: {asset_type}. VMT-to-BLEND is disabled.")
 

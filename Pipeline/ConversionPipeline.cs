@@ -33,6 +33,7 @@ internal sealed class ConversionPipeline(
         var reportPath = Path.Combine(outputRoot, "conversion-report.json");
 
         var expectedOutputs = BuildExpectedOutputs(assets, outputRoot);
+        PreserveReferencedMtlTextures(outputRoot, expectedOutputs);
         CleanOutputDirectory(outputRoot, reportPath, expectedOutputs);
 
         foreach (var asset in assets)
@@ -62,6 +63,7 @@ internal sealed class ConversionPipeline(
 
                 ConsoleReporter.Progress("QUEUE", $"{asset.Type}: {asset.RelativePath}");
 
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
                 jobs.Add(new AssetFileJob(jobType!, Path.GetFullPath(asset.FullPath), outputPath));
                 continue;
             }
@@ -143,6 +145,48 @@ internal sealed class ConversionPipeline(
         Console.WriteLine($"Skipped: {results.Count(r => r.Status == ConversionStatus.Skipped)}");
         Console.WriteLine($"Failed: {results.Count(r => r.Status == ConversionStatus.Failed)}");
         Console.WriteLine($"Report: {reportPath}");
+    }
+
+    private static void PreserveReferencedMtlTextures(
+    string outputRoot,
+    HashSet<string> expectedOutputs)
+    {
+        if (!Directory.Exists(outputRoot))
+            return;
+
+        var outputPrefix = Path.GetFullPath(outputRoot)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+
+        foreach (var mtlPath in Directory.EnumerateFiles(outputRoot, "*.mtl", SearchOption.AllDirectories))
+        {
+            var fullMtlPath = Path.GetFullPath(mtlPath);
+            if (!expectedOutputs.Contains(fullMtlPath))
+                continue;
+
+            try
+            {
+                foreach (var line in File.ReadLines(fullMtlPath))
+                {
+                    var texturePath = ResolveMtlTexturePath(fullMtlPath, line);
+                    if (texturePath is null || !File.Exists(texturePath))
+                        continue;
+
+                    var fullTexturePath = Path.GetFullPath(texturePath);
+                    if (fullTexturePath.StartsWith(outputPrefix, StringComparison.OrdinalIgnoreCase))
+                        expectedOutputs.Add(fullTexturePath);
+                }
+            }
+            catch (IOException)
+            {
+                // Damaged old MTLs shouldn't not stop the conversion pipeline
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Unreadable old MTLs must not shouldn't the conversion pipeline
+            }
+            // I feel like Bart Simpson at the chalkboard writing these
+        }
     }
 
     private HashSet<string> BuildExpectedOutputs(
@@ -282,13 +326,30 @@ internal sealed class ConversionPipeline(
         {
             var hasVertex = false;
             var hasFace = false;
+
             foreach (var line in File.ReadLines(objPath))
                 if (line.StartsWith("v ", StringComparison.Ordinal))
                     hasVertex = true;
                 else if (line.StartsWith("f ", StringComparison.Ordinal))
                     hasFace = true;
-                if (hasVertex && hasFace)
+
+            if (!hasVertex || !hasFace)
+                return false;
+
+            foreach (var line in File.ReadLines(mtlPath))
+            {
+                var fields = line.Trim().Split(
+                    (char[]?)null,
+                    StringSplitOptions.RemoveEmptyEntries);
+
+                if (fields.Length == 0 ||
+                    !fields[0].Equals("map_Kd", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var texturePath = ResolveMtlTexturePath(mtlPath, line);
+                if (texturePath is not null && IsNonEmptyFile(texturePath))
                     return true;
+            }
         }
         catch (IOException)
         {
@@ -300,5 +361,50 @@ internal sealed class ConversionPipeline(
         }
 
         return false;
+    }
+
+    private static string? ResolveMtlTexturePath(string mtlPath, string line)
+    {
+        var fields = line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (fields.Length < 2 ||
+            !fields[0].StartsWith("map_", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var index = 1;
+
+        while (index < fields.Length && fields[index].StartsWith("-", StringComparison.Ordinal))
+            switch (fields[index])
+            {
+                case "-o":
+                case "-s":
+                    index += 4;
+                    break;
+
+                case "-bm":
+                case "-boost":
+                case "-texres":
+                case "-clamp":
+                case "-blendu":
+                case "-blendv":
+                case "-imfchan":
+                case "-type":
+                    index += 2;
+                    break;
+
+                default:
+                    return null;
+            }
+        if (index >= fields.Length)
+            return null;
+
+        var reference = string.Join(" ", fields.Skip(index)).Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(reference))
+            return null;
+
+        reference = reference.Replace('/', Path.DirectorySeparatorChar);
+
+        return Path.IsPathRooted(reference)
+            ? Path.GetFullPath(reference)
+            : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(mtlPath)!, reference));
     }
 }
