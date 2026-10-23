@@ -287,7 +287,17 @@ def import_model(input_root, input_path, output_path, output_root):
     texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
     os.makedirs(texture_cache_path, exist_ok=True)
 
-    bpy.context.scene.sourceio_props.TextureCachePath = texture_cache_path
+    scene = bpy.context.scene
+
+    if hasattr(scene, "sourceio_props"):
+        scene.sourceio_props.TextureCachePath = texture_cache_path
+    elif hasattr(scene, "TextureCachePath"):
+        scene.TextureCachePath = texture_cache_path
+    else:
+        raise RuntimeError(
+            "SourceIO registered neither Scene.sourceio_props nor "
+            "the legacy Scene.TextureCachePath property."
+        )
 
     print(f"[model] SourceIO texture cache: {texture_cache_path}", flush=True)
 
@@ -409,7 +419,17 @@ def import_bsp(input_root, input_path, output_path, output_root):
 
     texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
     os.makedirs(texture_cache_path, exist_ok=True)
-    bpy.context.scene.sourceio_props.TextureCachePath = texture_cache_path
+    scene = bpy.context.scene
+
+    if hasattr(scene, "sourceio_props"):
+        scene.sourceio_props.TextureCachePath = texture_cache_path
+    elif hasattr(scene, "TextureCachePath"):
+        scene.TextureCachePath = texture_cache_path
+    else:
+        raise RuntimeError(
+            "SourceIO registered neither Scene.sourceio_props nor "
+            "the legacy Scene.TextureCachePath property."
+        )
     
     bpy.ops.sourceio.bsp(
         filepath=input_path,
@@ -606,80 +626,73 @@ def ensure_sourceio_registered():
     attributes_module = importlib.import_module(
         "SourceIO.blender_bindings.attributes"
     )
-
-    print(
-        f"[startup] SourceIO attributes: "
-        f"{attributes_module.__file__}",
-        flush=True,
-    )
-
-    if not hasattr(attributes_module, "SourceIO_PG_props"):
-        with open(
-            attributes_path,
-            "r",
-            encoding="utf-8-sig",
-        ) as source_file:
-            attributes_source = source_file.read()
-
-        if "class SourceIO_PG_props" not in attributes_source:
-            raise RuntimeError(
-                "The installed SourceIO attributes source does not define "
-                "SourceIO_PG_props. Check the installed add-on files. "
-                f"Source file: {attributes_path}"
-            )
-
-        print(
-            "[startup] SourceIO_PG_props is absent from the imported "
-            "module; executing its installed source file directly.",
-            flush=True,
-        )
-
-        exec(
-            compile(
-                attributes_source,
-                attributes_path,
-                "exec",
-            ),
-            attributes_module.__dict__,
-        )
-
-    if not hasattr(attributes_module, "SourceIO_PG_props"):
-        raise RuntimeError(
-            "SourceIO_PG_props is still missing after loading the "
-            "installed attributes source. "
-            f"Source file: {attributes_path}"
-        )
-
-    print(
-        "[startup] SourceIO_PG_props is available.",
-        flush=True,
-    )
-
     bindings_module = importlib.import_module(
         "SourceIO.blender_bindings.bindings"
     )
 
+    sourceio_version = getattr(
+        sourceio_module,
+        "bl_info",
+        {},
+    ).get("version", "unknown")
+
+    print(
+        f"[startup] SourceIO version: {sourceio_version}",
+        flush=True,
+    )
+    print(
+        f"[startup] SourceIO attributes: {attributes_module.__file__}",
+        flush=True,
+    )
     print(
         f"[startup] SourceIO bindings: {bindings_module.__file__}",
         flush=True,
     )
-    print(
-        "[startup] Registering SourceIO...",
-        flush=True,
+
+    has_grouped_properties = hasattr(
+        bpy.types.Scene,
+        "sourceio_props",
+    )
+    has_legacy_properties = all(
+        hasattr(bpy.types.Scene, name)
+        for name in legacy_scene_property_names
     )
 
-    bindings_module.register()
-
-    if not hasattr(bpy.types.Scene, "sourceio_props"):
-        raise RuntimeError(
-            "SourceIO.register() completed without creating "
-            "bpy.types.Scene.sourceio_props. "
-            f"Bindings: {bindings_module.__file__}; "
-            f"attributes: {attributes_path}"
+    if not (has_grouped_properties or has_legacy_properties):
+        print(
+            "[startup] Registering SourceIO through its official "
+            "bindings registration function...",
+            flush=True,
         )
 
+        bindings_module.register()
+
+    has_grouped_properties = hasattr(
+        bpy.types.Scene,
+        "sourceio_props",
+    )
+    has_legacy_properties = all(
+        hasattr(bpy.types.Scene, name)
+        for name in legacy_scene_property_names
+    )
+
+    if not (has_grouped_properties or has_legacy_properties):
+        raise RuntimeError(
+            "SourceIO registration returned without creating a recognized "
+            "Scene property API. "
+            f"Version: {sourceio_version}; "
+            f"bindings: {bindings_module.__file__}; "
+            f"attributes: {attributes_module.__file__}"
+        )
+
+    property_api = (
+        "Scene.sourceio_props"
+        if has_grouped_properties
+        else "legacy direct Scene properties"
+    )
+
     print(
-        "[startup] SourceIO registration completed successfully.",
+        f"[startup] SourceIO registration verified. API: {property_api}",
         flush=True,
     )
 
