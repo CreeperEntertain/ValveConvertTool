@@ -92,8 +92,8 @@ def pack_used_images():
 
 def scan_source_content(input_root):
     """
-    Mount extracted loose files and readable VPK archives without invoking
-    SourceIO's game detectors or opening gameinfo.txt.
+    Mount game-specific loose-file roots and readable VPK archives
+    without invoking SourceIO's automatic game detector.
     """
     from SourceIO.library.shared.content_manager import ContentManager
     from SourceIO.library.shared.content_manager.providers import register_provider
@@ -117,22 +117,38 @@ def scan_source_content(input_root):
         )
 
     content_manager = ContentManager()
-
     content_manager.clean()
 
-    loose_provider = LooseFilesContentProvider(TinyPath(root))
-    content_manager.add_child(register_provider(loose_provider))
-
-    mounted_vpk_count = 0
+    content_roots = {root}
     unreadable_vpks = []
     walk_errors = []
-
+    mounted_vpk_count = 0
     vpk_signature = b"\x34\x12\xAA\x55"
 
-    for directory, _, filenames in os.walk(
+    content_directory_names = {
+        "materials",
+        "models",
+        "maps",
+        "elements",
+    }
+
+    for directory, dirnames, filenames in os.walk(
         root,
         onerror=walk_errors.append,
     ):
+        directory = os.path.abspath(directory)
+
+        child_names = {name.casefold() for name in dirnames}
+        if child_names.intersection(content_directory_names):
+            content_roots.add(directory)
+
+        has_vpk = any(
+            filename.casefold().endswith(".vpk")
+            for filename in filenames
+        )
+        if has_vpk:
+            content_roots.add(directory)
+
         for filename in filenames:
             if not filename.casefold().endswith(".vpk"):
                 continue
@@ -158,18 +174,41 @@ def scan_source_content(input_root):
                 if len(unreadable_vpks) < 5:
                     unreadable_vpks.append((archive_path, str(exc)))
 
+    mounted_roots = []
+
+    for game_root in sorted(
+        content_roots,
+        key=lambda path: (path.count(os.sep), path.casefold()),
+    ):
+        provider = LooseFilesContentProvider(TinyPath(game_root))
+        content_manager.add_child(register_provider(provider))
+        mounted_roots.append(game_root)
+
     serialize_mounted_content(content_manager)
 
     print(
         f"[startup] SourceIO content mounted directly: "
-        f"root={root}; VPK archives={mounted_vpk_count}",
+        f"loose roots={len(mounted_roots)}; "
+        f"VPK archives={mounted_vpk_count}",
         flush=True,
     )
+
+    for game_root in mounted_roots[:10]:
+        print(
+            f"[startup] SourceIO loose root: {game_root}",
+            flush=True,
+        )
+
+    if len(mounted_roots) > 10:
+        print(
+            f"[startup] Additional loose roots: {len(mounted_roots) - 10}",
+            flush=True,
+        )
 
     if walk_errors:
         print(
             f"[startup] Warning: {len(walk_errors)} directory scan error(s) "
-            f"occurred while locating VPK archives.",
+            f"occurred while locating game roots and VPK archives.",
             flush=True,
         )
 
