@@ -457,21 +457,54 @@ def ensure_sourceio_registered():
     if hasattr(bpy.types.Scene, "sourceio_props"):
         return
 
-    import importlib
+        import importlib
+    import importlib.util
 
-    if "sourceio_module" not in locals() or sourceio_module is None:
+    stale_modules = [
+        name
+        for name in tuple(sys.modules)
+        if name == "SourceIO" or name.startswith("SourceIO.")
+    ]
+    for name in sorted(stale_modules, key=len, reverse=True):
+        sys.modules.pop(name, None)
+
+    init_path = os.path.join(addon_root, "__init__.py")
+
+    if not os.path.isfile(init_path):
         raise RuntimeError(
-            "SourceIO's package loader did not leave a sourceio_module "
-            "available before importing bindings."
+            f"SourceIO __init__.py was not found: {init_path}"
         )
 
-    sourceio_module.__path__ = [addon_root]
-    sourceio_module.__package__ = "SourceIO"
+    print(
+        f"[startup] Loading SourceIO package from: {addon_root}",
+        flush=True,
+    )
+
+    package_spec = importlib.util.spec_from_file_location(
+        "SourceIO",
+        init_path,
+        submodule_search_locations=[addon_root],
+    )
+
+    if package_spec is None or package_spec.loader is None:
+        raise RuntimeError(
+            f"Could not create a package loader for: {init_path}"
+        )
+
+    sourceio_module = importlib.util.module_from_spec(package_spec)
+
     sys.modules["SourceIO"] = sourceio_module
 
+    try:
+        package_spec.loader.exec_module(sourceio_module)
+    except Exception:
+        for name in tuple(sys.modules):
+            if name == "SourceIO" or name.startswith("SourceIO."):
+                sys.modules.pop(name, None)
+        raise
+
     print(
-        f"[startup] Registered SourceIO package: "
-        f"{sys.modules['SourceIO'].__path__[0]}",
+        f"[startup] SourceIO package loaded: {sourceio_module.__file__}",
         flush=True,
     )
 
