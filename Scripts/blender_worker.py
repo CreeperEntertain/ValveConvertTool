@@ -406,3 +406,7 @@ def main():
     result_path = os.path.splitext(manifest_path)[0] + ".results.json"
     with open(result_path, "w", encoding="utf-8") as file:
         json.dump(results, file, indent=2)
+
+
+if __name__ = "__main__":
+    main()
