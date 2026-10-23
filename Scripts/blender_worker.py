@@ -303,7 +303,7 @@ def import_bsp(input_root, input_path, output_path):
     bpy.ops.sourceio.bsp(
         filepath=input_path,
         discover_resources=True,
-        import_materials=True,
+        import_textures=True,
         use_bvlg=False,
     )
     validate_bsp_scene()
