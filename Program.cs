@@ -34,6 +34,7 @@ internal class Program
             var pipeline = new ConversionPipeline(options, scanner, fileSystem, blender);
 
             await pipeline.RunAsync();
+            Console.ReadKey();
             return 0;
         }
         catch (Exception ex)
