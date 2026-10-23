@@ -457,7 +457,7 @@ def ensure_sourceio_registered():
     if hasattr(bpy.types.Scene, "sourceio_props"):
         return
 
-        import importlib
+    import importlib
     import importlib.util
 
     stale_modules = [
