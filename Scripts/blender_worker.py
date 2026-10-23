@@ -543,6 +543,41 @@ def ensure_sourceio_registered():
 
     register_sourceio()
 
+    if not hasattr(bpy.types.Scene, "sourceio_props"):
+        print(
+            "[startup] Scene.sourceio_props is missing; "
+            "retrying SourceIO register_props()...",
+            flush=True,
+        )
+
+        from SourceIO.blender_bindings.attributes import register_props
+
+        try:
+            register_props()
+        except ValueError as exc:
+            if "already registered as a subclass" not in str(exc):
+                raise
+
+            props_class = getattr(bpy.types, "SourceIO_PG_props", None)
+
+            if props_class is None:
+                raise RuntimeError(
+                    "SourceIO's property group is already registered, "
+                    "but bpy.types.SourceIO_PG_props cannot be found."
+                ) from exc
+
+            bpy.types.Scene.sourceio_props = bpy.props.PointerProperty(
+                type=props_class
+            )
+
+    if not hasattr(bpy.types.Scene, "sourceio_props"):
+        raise RuntimeError(
+            "SourceIO property registration failed: "
+            "Scene.sourceio_props is still missing."
+        )
+
+    print("[startup] SourceIO Scene properties are ready.", flush=True)
+
     from bpy.props import CollectionProperty, PointerProperty
     from SourceIO.blender_bindings.attributes import SourceIO_PG_props
     from SourceIO.blender_bindings.operators.flex_operators import (
