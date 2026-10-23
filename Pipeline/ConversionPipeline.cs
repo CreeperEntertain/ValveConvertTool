@@ -98,7 +98,17 @@ internal sealed class ConversionPipeline(
                 ? "No Blender conversion jobs queued."
                 : $"Starting {jobs.Count} conversion job(s)");
 
-        results.AddRange(await blender.RunAsync(jobs, cancellationToken));
+        var orderedJobs = jobs
+            .OrderBy(job => job.Type switch
+            {
+                "texture" => 0,
+                "model" => 1,
+                "map" => 2,
+                _ => 3
+            })
+            .ToArray();
+
+        results.AddRange(await blender.RunAsync(orderedJobs, cancellationToken));
 
         foreach (var result in results)
         {

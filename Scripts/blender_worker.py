@@ -257,16 +257,17 @@ def node_tree_has_image_texture(node_tree, visited=None):
 
 
 def validate_bsp_scene():
-    """Reject empty BSP imports instead of saving unusable BLEND files."""
+    """Require usable BSP geometry, but never reject a map for missing textures."""
     mesh_objects = [
         obj for obj in bpy.context.scene.objects
         if obj.type == "MESH"
         and obj.data is not None
+        and len(obj.data.vertices) > 0
         and len(obj.data.polygons) > 0
     ]
 
     if not mesh_objects:
-        raise RuntimeError("BSP import produced no mesh geometry.")
+        raise RuntimeError("BSP import produced no usable mesh geometry.")
 
     materials = {
         slot.material
@@ -275,42 +276,25 @@ def validate_bsp_scene():
         if slot.material is not None
     }
 
-    if not materials:
-        raise RuntimeError("BSP import produced no materials assigned to mesh objects.")
-
-    textured_materials = []
-    empty_materials = []
-
-    for material in materials:
-        has_texture = (
-            material.use_nodes
-            and node_tree_has_image_texture(material.node_tree)
-        )
-
-        if has_texture:
-            textured_materials.append(material)
-        else:
-            empty_materials.append(material.name)
-
-    if empty_materials:
-        print(
-            f"[map] {len(empty_materials)} materials have no usable image textures. "
-            f"Examples: {empty_materials[:20]}",
-            flush=True,
-        )
-
-    if not textured_materials:
-        raise RuntimeError(
-            "BSP import produced no usable image-textured materials. "
-            "Check that SourceIO can detect the game's materials and textures."
-        )
+    textured_materials = [
+        material for material in materials
+        if material.use_nodes
+        and node_tree_has_image_texture(material.node_tree)
+    ]
 
     print(
-        f"[map] Validated {len(mesh_objects)} mesh objects, "
-        f"{len(materials)} assigned materials, "
-        f"{len(textured_materials)} textured materials",
+        f"[map] Geometry OK: {len(mesh_objects)} mesh objects; "
+        f"{len(materials)} assigned materials; "
+        f"{len(textured_materials)} textured materials.",
         flush=True,
     )
+
+    if not textured_materials:
+        print(
+            "[map] WARNING: no usable image-textured materials were found. "
+            "Saving the map anyway so its geometry is preserved.",
+            flush=True,
+        )
 
 
 def import_bsp(input_root, input_path, output_path):
@@ -318,10 +302,10 @@ def import_bsp(input_root, input_path, output_path):
         raise ValueError("Only an explicit .bsp source may create a .blend output.")
 
     ensure_parent(output_path)
-        scan_source_content(input_root)
+
     bpy.ops.sourceio.bsp(
         filepath=input_path,
-        discover_resources=False,
+        discover_resources=True,
         import_textures=True,
         use_bvlg=False,
     )
