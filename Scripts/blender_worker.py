@@ -227,6 +227,73 @@ def import_model(input_root, input_path, output_path):
     ensure_obj_material_library(output_path)
 
 
+def node_tree_has_image_texture(node_tree, visited=None):
+    """Return True if a material node tree contains a usable image texture."""
+    if node_tree is None:
+        return False
+
+    if visited is None:
+        visited = set()
+
+    pointer = node_tree.as_pointer()
+    if pointer in visited:
+        return False
+    visited.add(pointer)
+
+    for node in node_tree.nodes:
+        if node.type == "TEX_IMAGE":
+            image = node.image
+            if image is not None and image.has_data:
+                return True
+
+        if node.type == "GROUP" and node_tree_has_image_texture(node.node_tree, visited):
+            return True
+
+    return False
+
+
+def validate_bsp_scene():
+    """Reject empty BSP imports instead of saving unusable BLEND files."""
+    mesh_objects = [
+        obj for obj in bpy.context.scene.objects
+        if obj.type == "MESH"
+        and obj.data is not None
+        and len(obj.data.polygons) > 0
+    ]
+
+    if not mesh_objects:
+        raise RuntimeError("BSP import produced no mesh geometry.")
+
+    materials = {
+        slot.material
+        for obj in mesh_objects
+        for slot in obj.material_slots
+        if slot.material is not None
+    }
+
+    if not materials:
+        raise RuntimeError("BSP import produced no materials assigned to mesh objects.")
+
+    textured_materials = [
+        material for material in materials
+        if material.use_nodes
+        and node_tree_has_image_texture(material.node_tree)
+    ]
+
+    if not textured_materials:
+        raise RuntimeError(
+            "BSP import produced no usable image-textured materials. "
+            "Check that SourceIO can detect the game's materials and textures."
+        )
+
+    print(
+        f"[map] Validated {len(mesh_objects)} mesh objects, "
+        f"{len(materials)} assigned materials, "
+        f"{len(textured_materials)} textured materials",
+        flush=True,
+    )
+
+
 def import_bsp(input_root, input_path, output_path):
     if os.path.splitext(input_path)[1].casefold() != ".bsp":
         raise ValueError("Only an explicit .bsp source may create a .blend output.")
@@ -236,7 +303,10 @@ def import_bsp(input_root, input_path, output_path):
     bpy.ops.sourceio.bsp(
         filepath=input_path,
         discover_resources=True,
+        import_materials=True,
+        use_bvlg=False,
     )
+    validate_bsp_scene()
     pack_used_images()
     bpy.ops.wm.save_as_mainfile(filepath=output_path, check_existing=False)
 

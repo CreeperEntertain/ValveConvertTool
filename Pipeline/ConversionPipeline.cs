@@ -61,14 +61,6 @@ internal sealed class ConversionPipeline(
                         "OBJ geometry and its MTL already exist; conversion skipped."));
                     continue;
                 }
-                if (asset.Type == AssetType.Map && IsNonEmptyFile(outputPath))
-                {
-                    ConsoleReporter.Progress("SKIP", $"{asset.RelativePath} — BLEND output already exists");
-                    results.Add(new ConversionResult(
-                        asset.RelativePath, [outputPath], ConversionStatus.Skipped,
-                        "BLEND output for this explicit BSP already exists; conversion skipped."));
-                    continue;
-                }
 
                 ConsoleReporter.Progress("QUEUE", $"{asset.Type}: {asset.RelativePath}");
 
