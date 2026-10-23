@@ -59,11 +59,15 @@ def pack_used_images():
 
 
 def scan_source_content(input_root):
+    """Discover game content and persist its mounts for SourceIO import operators."""
     from SourceIO.library.shared.content_manager import ContentManager
     from SourceIO.library.utils.tiny_path import TinyPath
+    from SourceIO.blender_bindings.utils.resource_utils import serialize_mounted_content
 
     content_manager = ContentManager()
     content_manager.scan_for_content(TinyPath(input_root))
+
+    serialize_mounted_content(content_manager)
 
 
 def import_vtf(input_root, input_path, output_path):
@@ -274,11 +278,26 @@ def validate_bsp_scene():
     if not materials:
         raise RuntimeError("BSP import produced no materials assigned to mesh objects.")
 
-    textured_materials = [
-        material for material in materials
-        if material.use_nodes
-        and node_tree_has_image_texture(material.node_tree)
-    ]
+    textured_materials = []
+    empty_materials = []
+
+    for material in materials:
+        has_texture = (
+            material.use_nodes
+            and node_tree_has_image_texture(material.node_tree)
+        )
+
+        if has_texture:
+            textured_materials.append(material)
+        else:
+            empty_materials.append(material.name)
+
+    if empty_materials:
+        print(
+            f"[map] {len(empty_materials)} materials have no usable image textures. "
+            f"Examples: {empty_materials[:20]}",
+            flush=True,
+        )
 
     if not textured_materials:
         raise RuntimeError(
@@ -299,10 +318,10 @@ def import_bsp(input_root, input_path, output_path):
         raise ValueError("Only an explicit .bsp source may create a .blend output.")
 
     ensure_parent(output_path)
-    scan_source_content(input_root)
+        scan_source_content(input_root)
     bpy.ops.sourceio.bsp(
         filepath=input_path,
-        discover_resources=True,
+        discover_resources=False,
         import_textures=True,
         use_bvlg=False,
     )
