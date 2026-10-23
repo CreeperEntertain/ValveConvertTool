@@ -484,8 +484,12 @@ def main():
     input_root = os.path.abspath(manifest["input_root"])
     output_root = os.path.abspath(manifest["output_root"])
     jobs = manifest["jobs"]
+    sourceio_registered = False
+
     if jobs:
         ensure_sourceio_registered()
+        sourceio_registered = True
+
     results = []
 
     for job in jobs:
@@ -536,6 +540,17 @@ def main():
                 "Status": 3,
                 "Message": str(exc),
             })
+
+    if sourceio_registered:
+        try:
+            from SourceIO.blender_bindings.bindings import unregister_custom_icon
+
+            unregister_custom_icon()
+        except Exception as exc:
+            print(
+                f"[shutdown] Warning: could not release SourceIO icon previews: {exc}",
+                flush=True,
+            )
 
     result_path = os.path.splitext(manifest_path)[0] + ".results.json"
     with open(result_path, "w", encoding="utf-8") as file:

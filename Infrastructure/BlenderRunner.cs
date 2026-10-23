@@ -41,6 +41,7 @@ internal sealed class BlenderRunner(AppOptions options)
                 CreateNoWindow = true
             };
 
+            startInfo.ArgumentList.Add("--factory-startup");
             startInfo.ArgumentList.Add("--background");
             startInfo.ArgumentList.Add("--python");
             startInfo.ArgumentList.Add(workerPath);
