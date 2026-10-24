@@ -3,6 +3,12 @@ import json
 import os
 import sys
 import traceback
+import atexit
+from pathlib import PurePosixPath
+
+from versioned_content import DEFAULT_VERSIONED_CONTENT_VIEWS
+
+atexit.register(DEFAULT_VERSIONED_CONTENT_VIEWS.cleanup)
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 BLEND_SIGNATURE = b"BLENDER"
@@ -456,7 +462,18 @@ def import_model(input_root, input_path, output_path, output_root):
 
     ensure_parent(output_path)
 
-    model_directory = os.path.dirname(os.path.abspath(input_path))
+    relative_path = get_relative_input_path(input_root, input_path)
+    resolved_root, relative_path, model_version = (
+        DEFAULT_VERSIONED_CONTENT_VIEWS.resolve(input_root, relative_path)
+    )
+    resolved_input_path = os.path.join(
+        str(resolved_root),
+        *PurePosixPath(relative_path).parts,
+    )
+
+    scan_source_content(str(resolved_root))
+
+    model_directory = os.path.dirname(resolved_input_path)
     texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
     os.makedirs(texture_cache_path, exist_ok=True)
 
@@ -481,7 +498,7 @@ def import_model(input_root, input_path, output_path, output_root):
     try:
         operator_result = bpy.ops.sourceio.mdl(
             directory=model_directory,
-            files=[{"name": os.path.basename(input_path)}],
+            files=[{"name": os.path.basename(resolved_input_path)}],
             discover_resources=False,
             import_textures=True,
             import_animations=False,
@@ -610,6 +627,17 @@ def import_bsp(input_root, input_path, output_path, output_root):
 
     ensure_parent(output_path)
 
+    relative_path = get_relative_input_path(input_root, input_path)
+    resolved_root, relative_path, map_version = (
+        DEFAULT_VERSIONED_CONTENT_VIEWS.resolve(input_root, relative_path)
+    )
+    resolved_input_path = os.path.join(
+        str(resolved_root),
+        *PurePosixPath(relative_path).parts,
+    )
+
+    scan_source_content(str(resolved_root))
+
     texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
     os.makedirs(texture_cache_path, exist_ok=True)
     scene = bpy.context.scene
@@ -629,7 +657,7 @@ def import_bsp(input_root, input_path, output_path, output_root):
 
     try:
         operator_result = bpy.ops.sourceio.bsp(
-            filepath=input_path,
+            filepath=resolved_input_path,
             discover_resources=False,
             import_textures=True,
             use_bvlg=False,
@@ -918,14 +946,6 @@ def main():
     if jobs:
         ensure_sourceio_registered()
         sourceio_registered = True
-
-        needs_source_content = any(
-            job.get("type", job.get("Type")) in ("model", "map")
-            for job in jobs
-        )
-
-        if needs_source_content:
-            scan_source_content(input_root)
 
     results = []
 
