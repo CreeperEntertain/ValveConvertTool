@@ -236,6 +236,16 @@ def scan_source_content(input_root):
             )
 
 
+def reset_sourceio_content_state(content_manager):
+    """
+    Reset per-import state without unmounting SourceIO content.
+    """
+    content_manager.first_import = None
+    content_manager.priority_list = None
+    content_manager._cache.clear()
+    content_manager._clear_meta_caches()
+
+
 def import_vtf(input_root, input_path, output_path):
     ensure_parent(output_path)
     relative_path = get_relative_input_path(input_root, input_path)
@@ -377,11 +387,11 @@ def get_mtl_texture_path(line):
 
 
 def validate_obj_textures(output_path):
-    """Require at least one diffuse MTL reference that resolves to a real PNG."""
+    """Verify diffuse textures, but don't reject usable model geometry if missing."""
     mtl_path = os.path.splitext(output_path)[0] + ".mtl"
 
-    if not os.path.isfile(mtl_path):
-        raise RuntimeError("Model export has no MTL material library.")
+    if not os.path.isfile(mtl_path) or os.path.getsize(mtl_path) == 0:
+        raise RuntimeError("Model export has no non-empty MTL material library.")
 
     with open(mtl_path, "r", encoding="utf-8", errors="replace") as file:
         for line in file:
@@ -394,7 +404,10 @@ def validate_obj_textures(output_path):
                 continue
 
             if not os.path.isabs(texture_reference):
-                texture_reference = os.path.join(os.path.dirname(mtl_path), texture_reference)
+                texture_reference = os.path.join(
+                    os.path.dirname(mtl_path),
+                    texture_reference,
+                )
 
             texture_path = os.path.abspath(texture_reference)
             if not os.path.isfile(texture_path) or os.path.getsize(texture_path) == 0:
@@ -406,15 +419,19 @@ def validate_obj_textures(output_path):
                         f"[model] Verified diffuse texture: {texture_path}",
                         flush=True,
                     )
-                    return
+                    return True
 
-    raise RuntimeError(
-        "Model geometry exported, but its MTL has no valid map_Kd PNG "
-        "reference. Texture import or material-to-image linking failed."
+    print(
+        f"[model] WARNING: {output_path} has usable geometry and an MTL, "
+        "but no resolvable diffuse PNG. Keeping the OBJ and MTL.",
+        flush=True,
     )
+    return False
 
 
 def import_model(input_root, input_path, output_path, output_root):
+    from SourceIO.library.shared.content_manager import ContentManager
+
     ensure_parent(output_path)
 
     model_directory = os.path.dirname(os.path.abspath(input_path))
@@ -435,13 +452,27 @@ def import_model(input_root, input_path, output_path, output_root):
 
     print(f"[model] SourceIO texture cache: {texture_cache_path}", flush=True)
 
-    bpy.ops.sourceio.mdl(
-        directory=model_directory,
-        files=[{"name": os.path.basename(input_path)}],
-        discover_resources=False,
-        import_textures=True,
-        import_animations=False,
-    )
+    content_manager = ContentManager()
+
+    reset_sourceio_content_state(content_manager)
+
+    try:
+        operator_result = bpy.ops.sourceio.mdl(
+            directory=model_directory,
+            files=[{"name": os.path.basename(input_path)}],
+            discover_resources=False,
+            import_textures=True,
+            import_animations=False,
+        )
+    finally:
+        reset_sourceio_content_state(content_manager)
+
+    if "CANCELLED" in operator_result:
+        raise RuntimeError(
+            f"SourceIO 5.5.4 cancelled the MDL import for {input_path}. "
+            "Check the model's required VVD/VTX companion files and the "
+            "SourceIO error immediately preceding this message."
+        )
 
     mesh_objects = [
         obj for obj in bpy.context.scene.objects
@@ -451,7 +482,11 @@ def import_model(input_root, input_path, output_path, output_root):
         and len(obj.data.polygons) > 0
     ]
     if not mesh_objects:
-        raise RuntimeError("SourceIO imported no mesh geometry for this MDL. Check its matching VVD/VTX files.")
+        raise RuntimeError(
+            f"SourceIO completed the MDL operator but imported no usable "
+            f"mesh geometry for {input_path}. Check its MDL version and "
+            "matching VVD/VTX companion files."
+        )
 
     fallback = bpy.data.materials.get(DEFAULT_MATERIAL)
     if fallback is None:
@@ -546,6 +581,8 @@ def validate_bsp_scene():
 
 
 def import_bsp(input_root, input_path, output_path, output_root):
+    from SourceIO.library.shared.content_manager import ContentManager
+
     if os.path.splitext(input_path)[1].casefold() != ".bsp":
         raise ValueError("Only an explicit .bsp source may create a .blend output.")
 
@@ -564,13 +601,25 @@ def import_bsp(input_root, input_path, output_path, output_root):
             "SourceIO registered neither Scene.sourceio_props nor "
             "the legacy Scene.TextureCachePath property."
         )
-    
-    bpy.ops.sourceio.bsp(
-        filepath=input_path,
-        discover_resources=False,
-        import_textures=True,
-        use_bvlg=False,
-    )
+
+    content_manager = ContentManager()
+    reset_sourceio_content_state(content_manager)
+
+    try:
+        operator_result = bpy.ops.sourceio.bsp(
+            filepath=input_path,
+            discover_resources=False,
+            import_textures=True,
+            use_bvlg=False,
+        )
+    finally:
+        reset_sourceio_content_state(content_manager)
+
+    if "CANCELLED" in operator_result:
+        raise RuntimeError(
+            f"SourceIO 5.5.4 cancelled the BSP import for {input_path}."
+        )
+
     validate_bsp_scene()
     pack_used_images()
     bpy.ops.wm.save_as_mainfile(filepath=output_path, check_existing=False)

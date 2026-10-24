@@ -197,8 +197,8 @@ internal sealed class ConversionPipeline(
     }
 
     private static void PreserveReferencedMtlTextures(
-    string outputRoot,
-    HashSet<string> expectedOutputs)
+        string outputRoot,
+        HashSet<string> expectedOutputs)
     {
         if (!Directory.Exists(outputRoot))
             return;
@@ -377,10 +377,12 @@ internal sealed class ConversionPipeline(
             var hasFace = false;
 
             foreach (var line in File.ReadLines(objPath))
+            {
                 if (line.StartsWith("v ", StringComparison.Ordinal))
                     hasVertex = true;
                 else if (line.StartsWith("f ", StringComparison.Ordinal))
                     hasFace = true;
+            }
 
             if (!hasVertex || !hasFace)
                 return false;
@@ -391,12 +393,7 @@ internal sealed class ConversionPipeline(
                     (char[]?)null,
                     StringSplitOptions.RemoveEmptyEntries);
 
-                if (fields.Length == 0 ||
-                    !fields[0].Equals("map_Kd", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var texturePath = ResolveMtlTexturePath(mtlPath, line);
-                if (texturePath is not null && IsNonEmptyFile(texturePath))
+                if (fields.Length > 1 && fields[0].Equals("newmtl", StringComparison.OrdinalIgnoreCase))
                     return true;
             }
         }
