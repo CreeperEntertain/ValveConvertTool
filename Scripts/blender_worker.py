@@ -1252,7 +1252,7 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
 
         strip = track.strips.new(
             action.name,
-            float(bpy.context.scene.frame_start),
+            int(bpy.context.scene.frame_start),
             action,
         )
 
