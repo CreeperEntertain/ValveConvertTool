@@ -1500,21 +1500,24 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
             f"{PurePosixPath(model_path).stem}_{animation.name}"
         )
         action = bpy.data.actions.new(name=action_name)
-        action["source_fps"] = float(
-            getattr(animation, "fps", 0.0) or 30.0
+        source_fps = _finite_number(
+            getattr(animation, "fps", 30.0),
+            30.0,
         )
+        if source_fps <= 0.0:
+            source_fps = 30.0
+
+        action["source_fps"] = source_fps
 
         scene = bpy.context.scene
+        fps_base = _finite_number(scene.render.fps_base, 1.0)
+        if fps_base <= 0.0:
+            fps_base = 1.0
+
         gltf_frame_rate = (
-            float(scene.render.fps)
-            * float(scene.render.fps_base)
+            _finite_number(scene.render.fps, 30.0) / fps_base
         )
-        source_fps = float(action["source_fps"])
-        frame_scale = (
-            gltf_frame_rate / source_fps
-            if source_fps > 0.0
-            else 1.0
-        )
+        frame_scale = gltf_frame_rate / source_fps
 
         factory = ActionCurveFactory(action, armature)
         curve_count = 0
