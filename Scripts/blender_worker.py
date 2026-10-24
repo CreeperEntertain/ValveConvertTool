@@ -70,6 +70,9 @@ DEFAULT_MATERIAL = "ValveConvert_Default"
 class UnsupportedTextureError(RuntimeError):
     """A VTF file could not be decoded into usable pixels."""
 
+class NonGeometryModelError(RuntimeError):
+    """An MDL contains no mesh geometry that can be exported to GLB."""
+
 
 def clear_scene():
     if bpy.context.scene.objects:
@@ -756,9 +759,23 @@ def _select_compatible_model_dependencies(
     model_version,
 ):
     """Select the preferred eligible VVD/VTX pair that passes index checks."""
-    mdl_format_version, mdl = _load_mdl_for_pair_check(
+        mdl_format_version, mdl = _load_mdl_for_pair_check(
         physical_model_path
     )
+
+    if mdl is not None:
+        has_mesh_geometry = any(
+            getattr(model, "vertex_count", 0) > 0
+            for body_part in getattr(mdl, "body_parts", ())
+            for model in getattr(body_part, "models", ())
+        )
+
+        if not has_mesh_geometry:
+            raise NonGeometryModelError(
+                "MDL contains no mesh geometry; it may be an "
+                "animation/sequence-only asset and cannot produce "
+                f"a mesh GLB: {physical_model_path}"
+            )
 
     model_path = PurePosixPath(model_relative_to_game)
 
@@ -1766,6 +1783,19 @@ def main():
                 "OutputPaths": output_paths,
                 "Status": 0,
                 "Message": None,
+            })
+
+        except NonGeometryModelError as exc:
+            print(
+                f"[model-skip] {input_path}: {exc}",
+                flush=True,
+            )
+            remove_failed_outputs(asset_type, output_path)
+            results.append({
+                "InputPath": input_path,
+                "OutputPaths": [],
+                "Status": 2,
+                "Message": str(exc),
             })
 
         except UnsupportedTextureError as exc:
