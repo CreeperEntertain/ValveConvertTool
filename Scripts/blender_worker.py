@@ -320,12 +320,446 @@ def _choose_material_image(entries, include, exclude=()):
     return None
 
 
+def _collect_material_image_entries(material):
+    entries = []
+
+    for node, image in _iter_material_image_nodes(material.node_tree):
+        label = " ".join(
+            str(value or "")
+            for value in (node.name, node.label, image.name)
+        )
+        entries.append((node, image, label))
+
+    return entries
+
+
+def _images_for_material_role(entries, role):
+    if role == "base_color":
+        include = (
+            "basetexture", "base_texture", "base texture",
+            "basecolor", "base color", "albedo", "diffuse",
+            "texture2", "detail", "compress", "stretch",
+        )
+        exclude = (
+            "normal", "bump", "rough", "metal", "spec",
+            "emissive", "emission", "alpha", "mask",
+            "envmap", "environment", "lightwarp", "phong",
+            "selfillum",
+        )
+    elif role == "normal":
+        include = (
+            "normal", "bumpmap", "bump_map", "bumpcompress",
+            "bumpstretch",
+        )
+        exclude = ("envmap", "phong", "selfillum", "mask")
+    else:
+        return []
+
+    images = []
+    seen = set()
+
+    for node, image, _ in entries:
+        node_label = " ".join(
+            str(value or "") for value in (node.name, node.label)
+        ).casefold()
+
+        label = (
+            node_label
+            if "$" in node_label
+            else f"{node_label} {image.name}".casefold()
+        )
+
+        if not any(token in label for token in include):
+            continue
+        if any(token in label for token in exclude):
+            continue
+
+        image_id = image.as_pointer()
+        if image_id not in seen:
+            seen.add(image_id)
+            images.append(image)
+
+    return images
+
+
+def _material_tree_has_node_type(node_tree, wanted, visited=None):
+    if node_tree is None:
+        return False
+
+    if visited is None:
+        visited = set()
+
+    pointer = node_tree.as_pointer()
+    if pointer in visited:
+        return False
+    visited.add(pointer)
+
+    for node in node_tree.nodes:
+        if node.type in wanted:
+            return True
+
+        if node.type == "GROUP" and node.node_tree is not None:
+            if _material_tree_has_node_type(
+                node.node_tree, wanted, visited
+            ):
+                return True
+
+    return False
+
+
+def _bake_source_material_channel(obj, material, source_images, role):
+    """Bake a SourceIO material channel before simplifying its node tree."""
+    if not source_images or not material.use_nodes:
+        return None
+
+    if len(obj.data.uv_layers) == 0:
+        return None
+
+    node_tree = material.node_tree
+
+    has_bsdf = _material_tree_has_node_type(
+        node_tree,
+        {
+            "BSDF_PRINCIPLED",
+            "BSDF_DIFFUSE",
+            "BSDF_GLOSSY",
+            "BSDF_ANISOTROPIC",
+        },
+    )
+
+    if role == "normal":
+        if not has_bsdf:
+            return None
+        bake_type = "NORMAL"
+    elif has_bsdf:
+        bake_type = "DIFFUSE"
+    elif _material_tree_has_node_type(node_tree, {"EMISSION"}):
+        bake_type = "EMIT"
+    else:
+        return None
+
+    width = min(
+        4096,
+        max(1, max(int(image.size[0]) for image in source_images)),
+    )
+    height = min(
+        4096,
+        max(1, max(int(image.size[1]) for image in source_images)),
+    )
+
+    image = bpy.data.images.new(
+        name=f"{material.name}_{role}_baked",
+        width=width,
+        height=height,
+        alpha=True,
+        float_buffer=False,
+    )
+    image.use_fake_user = True
+
+    scene = bpy.context.scene
+    old_engine = scene.render.engine
+    old_active = bpy.context.view_layer.objects.active
+    old_selected = list(bpy.context.selected_objects)
+    old_samples = getattr(scene.cycles, "samples", None)
+
+    tree_states = []
+    seen_trees = set()
+
+    target_node = None
+    success = False
+
+    try:
+        for slot in obj.material_slots:
+            other_material = slot.material
+            if (
+                other_material is None
+                or not other_material.use_nodes
+                or other_material.node_tree is None
+            ):
+                continue
+
+            tree = other_material.node_tree
+            pointer = tree.as_pointer()
+
+            if pointer in seen_trees:
+                continue
+            seen_trees.add(pointer)
+
+            selected_nodes = [
+                (node, node.select) for node in tree.nodes
+            ]
+            tree_states.append(
+                (tree, tree.nodes.active, selected_nodes)
+            )
+
+            for node in tree.nodes:
+                node.select = False
+            tree.nodes.active = None
+
+        target_node = node_tree.nodes.new("ShaderNodeTexImage")
+        target_node.name = "ValveConvert Bake Target"
+        target_node.label = "ValveConvert Bake Target"
+        target_node.image = image
+        target_node.select = True
+        node_tree.nodes.active = target_node
+
+        for selected_obj in bpy.context.selected_objects:
+            selected_obj.select_set(False)
+
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        scene.render.engine = "CYCLES"
+        if old_samples is not None:
+            scene.cycles.samples = 1
+
+        if bake_type == "NORMAL":
+            bpy.ops.object.bake(
+                type="NORMAL",
+                normal_space="TANGENT",
+                margin=4,
+                use_clear=True,
+            )
+            image.colorspace_settings.name = "Non-Color"
+        else:
+            bake_options = {
+                "type": bake_type,
+                "margin": 4,
+                "use_clear": True,
+            }
+
+            if bake_type == "DIFFUSE":
+                bake_options["pass_filter"] = {"COLOR"}
+
+            bpy.ops.object.bake(**bake_options)
+            image.colorspace_settings.name = "sRGB"
+
+        image.pack()
+        success = True
+
+    except Exception as exc:
+        print(
+            f"[model] Could not bake {role} for "
+            f"{material.name!r}; retaining the original texture "
+            f"selection: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    finally:
+        if target_node is not None:
+            try:
+                node_tree.nodes.remove(target_node)
+            except (ReferenceError, RuntimeError):
+                pass
+
+        for tree, active_node, selected_nodes in tree_states:
+            for node, was_selected in selected_nodes:
+                try:
+                    node.select = was_selected
+                except ReferenceError:
+                    pass
+
+            try:
+                tree.nodes.active = active_node
+            except (ReferenceError, RuntimeError):
+                pass
+
+        scene.render.engine = old_engine
+        if old_samples is not None:
+            scene.cycles.samples = old_samples
+
+        for selected_obj in bpy.context.selected_objects:
+            selected_obj.select_set(False)
+
+        for selected_obj in old_selected:
+            try:
+                selected_obj.select_set(True)
+            except ReferenceError:
+                pass
+
+        try:
+            bpy.context.view_layer.objects.active = old_active
+        except (ReferenceError, RuntimeError):
+            pass
+
+        if not success:
+            bpy.data.images.remove(image, do_unlink=True)
+            return None
+
+    return image
+
+
+def _source_material_parameter(material, wanted_name):
+    params = material.get("vmt_parameters")
+    wanted_name = wanted_name.casefold()
+
+    def search(mapping):
+        try:
+            items = list(mapping.items())
+        except (AttributeError, TypeError):
+            return False, None
+
+        for key, value in items:
+            if str(key).casefold() == wanted_name:
+                return True, value
+
+        for _, value in items:
+            if hasattr(value, "items"):
+                found, result = search(value)
+                if found:
+                    return True, result
+
+        return False, None
+
+    return search(params)
+
+
+def _source_material_alpha_policy(material):
+    def flag(name):
+        found, value = _source_material_parameter(material, name)
+        if not found or value is None:
+            return False
+
+        if isinstance(value, str):
+            return value.strip().casefold() in {
+                "1", "true", "yes", "on"
+            }
+
+        return _finite_number(value, 0.0) != 0.0
+
+    found_alpha, alpha_value = _source_material_parameter(
+        material, "$alpha"
+    )
+    alpha_factor = (
+        _finite_number(alpha_value, 1.0)
+        if found_alpha
+        else 1.0
+    )
+    alpha_factor = min(1.0, max(0.0, alpha_factor))
+
+    found_cutoff, cutoff_value = _source_material_parameter(
+        material, "$alphatestreference"
+    )
+    alpha_cutoff = (
+        _finite_number(cutoff_value, 0.5)
+        if found_cutoff
+        else 0.5
+    )
+
+    translucent = flag("$translucent")
+    alpha_test = flag("$alphatest")
+    additive = flag("$additive")
+    vertex_alpha = flag("$vertexalpha")
+
+    has_vmt_parameters = bool(
+        params := material.get("vmt_parameters")
+    )
+
+    if not has_vmt_parameters:
+        surface_method = getattr(
+            material, "surface_render_method", ""
+        )
+        blend_method = getattr(material, "blend_method", "")
+
+        translucent = (
+            surface_method == "BLENDED"
+            or blend_method == "BLEND"
+        )
+        alpha_test = (
+            surface_method == "DITHERED"
+            or blend_method in {"HASHED", "CLIP"}
+        )
+
+    use_texture_alpha = translucent or alpha_test or additive
+
+    return (
+        use_texture_alpha,
+        vertex_alpha,
+        alpha_factor,
+        alpha_test,
+        alpha_cutoff,
+    )
+
+
 def prepare_materials_for_gltf(mesh_objects):
-    """
-    Convert SourceIO materials to glTF-compatible Principled BSDF materials.
-    Preserve recognizable base-color, normal, roughness, metallic and
-    emissive images when SourceIO's material graph exposes them.
-    """
+    """Convert SourceIO materials to glTF-compatible Principled BSDF materials."""
+    for obj in mesh_objects:
+        if len(obj.data.uv_layers) == 0:
+            continue
+
+        for slot in obj.material_slots:
+            source_material = slot.material
+
+            if (
+                source_material is None
+                or not source_material.use_nodes
+                or source_material.node_tree is None
+            ):
+                continue
+
+            entries = _collect_material_image_entries(
+                source_material
+            )
+
+            base_images = _images_for_material_role(
+                entries, "base_color"
+            )
+            normal_images = _images_for_material_role(
+                entries, "normal"
+            )
+
+            needs_base_bake = len(base_images) > 1
+            needs_normal_bake = len(normal_images) > 1
+
+            if not needs_base_bake and not needs_normal_bake:
+                continue
+
+            copied_material = source_material.copy()
+            slot.material = copied_material
+            baked_anything = False
+
+            if needs_base_bake:
+                baked_image = _bake_source_material_channel(
+                    obj,
+                    copied_material,
+                    base_images,
+                    "base_color",
+                )
+                if baked_image is not None:
+                    copied_material[
+                        "_valveconvert_baked_base_color"
+                    ] = baked_image.name
+                    baked_anything = True
+                    print(
+                        f"[model] Baked layered base color for "
+                        f"{copied_material.name!r}",
+                        flush=True,
+                    )
+
+            if needs_normal_bake:
+                baked_image = _bake_source_material_channel(
+                    obj,
+                    copied_material,
+                    normal_images,
+                    "normal",
+                )
+                if baked_image is not None:
+                    copied_material[
+                        "_valveconvert_baked_normal"
+                    ] = baked_image.name
+                    baked_anything = True
+                    print(
+                        f"[model] Baked layered normals for "
+                        f"{copied_material.name!r}",
+                        flush=True,
+                    )
+
+            if not baked_anything:
+                slot.material = source_material
+                bpy.data.materials.remove(
+                    copied_material, do_unlink=True
+                )
+
     materials = {
         slot.material
         for obj in mesh_objects
@@ -335,30 +769,24 @@ def prepare_materials_for_gltf(mesh_objects):
 
     for material in materials:
         material.use_nodes = True
-        entries = []
+        entries = _collect_material_image_entries(material)
         packed_ids = set()
 
-        for node, image in _iter_material_image_nodes(
-            material.node_tree
-        ):
-            label = " ".join(
-                str(value or "")
-                for value in (node.name, node.label, image.name)
-            )
-            entries.append((node, image, label))
-
+        for _, image, _ in entries:
             image_id = image.as_pointer()
-            if image_id not in packed_ids:
-                packed_ids.add(image_id)
-                try:
-                    if image.has_data and image.packed_file is None:
-                        image.pack()
-                except Exception as exc:
-                    print(
-                        f"[model] Warning: could not pack "
-                        f"{image.name!r}: {exc}",
-                        flush=True,
-                    )
+            if image_id in packed_ids:
+                continue
+
+            packed_ids.add(image_id)
+            try:
+                if image.has_data and image.packed_file is None:
+                    image.pack()
+            except Exception as exc:
+                print(
+                    f"[model] Warning: could not pack "
+                    f"{image.name!r}: {exc}",
+                    flush=True,
+                )
 
         excluded = (
             "normal", "bump", "rough", "metal", "spec",
@@ -373,6 +801,15 @@ def prepare_materials_for_gltf(mesh_objects):
             ),
             excluded,
         )
+        source_base_image = base_image
+
+        baked_base_name = material.get(
+            "_valveconvert_baked_base_color", ""
+        )
+        if baked_base_name:
+            baked_image = bpy.data.images.get(baked_base_name)
+            if baked_image is not None:
+                base_image = baked_image
         if base_image is None:
             base_image = next(
                 (
@@ -385,6 +822,14 @@ def prepare_materials_for_gltf(mesh_objects):
         normal_image = _choose_material_image(
             entries, ("normal", "normalmap", "normal_map", "bump")
         )
+        baked_normal_name = material.get(
+            "_valveconvert_baked_normal", ""
+        )
+        if baked_normal_name:
+            baked_image = bpy.data.images.get(baked_normal_name)
+            if baked_image is not None:
+                normal_image = baked_image
+
         roughness_image = _choose_material_image(
             entries, ("roughness", "rough")
         )
@@ -429,7 +874,9 @@ def prepare_materials_for_gltf(mesh_objects):
 
             return texture
 
-        connect_image(base_image, "Base Color", 200)
+        base_texture_node = connect_image(
+            base_image, "Base Color", 200
+        )
         connect_image(roughness_image, "Roughness", -100, True)
         connect_image(metallic_image, "Metallic", -300, True)
 
@@ -459,7 +906,71 @@ def prepare_materials_for_gltf(mesh_objects):
             )
             connect_image(emissive_image, emission_socket, -700)
 
+        (
+            use_texture_alpha,
+            use_vertex_alpha,
+            alpha_factor,
+            alpha_test,
+            alpha_cutoff,
+        ) = _source_material_alpha_policy(material)
+
         alpha_socket = principled.inputs.get("Alpha")
+
+        if alpha_socket is not None:
+            alpha_socket.default_value = alpha_factor
+            alpha_signals = []
+
+            if use_texture_alpha and source_base_image is not None:
+                if source_base_image == base_image:
+                    alpha_node = base_texture_node
+                else:
+                    alpha_node = tree.nodes.new("ShaderNodeTexImage")
+                    alpha_node.image = source_base_image
+                    alpha_node.label = source_base_image.name
+
+                alpha_output = alpha_node.outputs.get("Alpha")
+                if alpha_output is not None:
+                    alpha_signals.append(alpha_output)
+
+            if use_vertex_alpha:
+                vertex_color = tree.nodes.new(
+                    "ShaderNodeVertexColor"
+                )
+                alpha_output = vertex_color.outputs.get("Alpha")
+                if alpha_output is not None:
+                    alpha_signals.append(alpha_output)
+
+            if len(alpha_signals) == 2:
+                multiply = tree.nodes.new("ShaderNodeMath")
+                multiply.operation = "MULTIPLY"
+                tree.links.new(
+                    alpha_signals[0], multiply.inputs[0]
+                )
+                tree.links.new(
+                    alpha_signals[1], multiply.inputs[1]
+                )
+                alpha_signal = multiply.outputs[0]
+            elif alpha_signals:
+                alpha_signal = alpha_signals[0]
+            else:
+                alpha_signal = None
+
+            if alpha_signal is not None and alpha_factor < 1.0:
+                multiply = tree.nodes.new("ShaderNodeMath")
+                multiply.operation = "MULTIPLY"
+                tree.links.new(alpha_signal, multiply.inputs[0])
+                multiply.inputs[1].default_value = alpha_factor
+                alpha_signal = multiply.outputs[0]
+
+            if alpha_signal is not None and alpha_test:
+                threshold = tree.nodes.new("ShaderNodeMath")
+                threshold.operation = "GREATER_THAN"
+                tree.links.new(alpha_signal, threshold.inputs[0])
+                threshold.inputs[1].default_value = alpha_cutoff
+                alpha_signal = threshold.outputs[0]
+
+            if alpha_signal is not None:
+                tree.links.new(alpha_signal, alpha_socket)
         if alpha_socket is not None and base_image is not None:
             alpha_texture = next(
                 (
