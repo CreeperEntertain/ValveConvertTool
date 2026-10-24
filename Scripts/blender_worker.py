@@ -1541,7 +1541,7 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                 )
                 quaternion = Quaternion((w, x, y, z))
 
-                if quaternion.length_squared < 1e-12:
+                if quaternion.dot(quaternion) < 1e-12:
                     quaternion = Quaternion()
                 else:
                     quaternion.normalize()
