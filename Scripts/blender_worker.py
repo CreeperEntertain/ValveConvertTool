@@ -1504,6 +1504,18 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
             getattr(animation, "fps", 0.0) or 30.0
         )
 
+        scene = bpy.context.scene
+        gltf_frame_rate = (
+            float(scene.render.fps)
+            * float(scene.render.fps_base)
+        )
+        source_fps = float(action["source_fps"])
+        frame_scale = (
+            gltf_frame_rate / source_fps
+            if source_fps > 0.0
+            else 1.0
+        )
+
         factory = ActionCurveFactory(action, armature)
         curve_count = 0
 
@@ -1611,7 +1623,10 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                     coordinates = []
                     for frame_index, value in enumerate(channel_values):
                         coordinates.extend(
-                            (float(frame_index), float(value))
+                            (
+                                float(frame_index) * frame_scale,
+                                float(value),
+                            )
                         )
 
                     curve.keyframe_points.foreach_set(
@@ -1715,14 +1730,7 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
         strip.blend_type = "REPLACE"
         strip.extrapolation = "NOTHING"
 
-        scene = bpy.context.scene
-        scene_fps = (
-            float(scene.render.fps)
-            / max(float(scene.render.fps_base), 1e-6)
-        )
-        source_fps = float(action.get("source_fps", scene_fps))
-        if source_fps > 0.0:
-            strip.scale = scene_fps / source_fps
+        strip.scale = 1.0
 
         track.mute = False
         tracks_created += 1
@@ -1948,7 +1956,8 @@ def import_model(input_root, input_path, output_path, output_root):
         export_image_format="AUTO",
         export_materials="EXPORT",
         export_animations=True,
-        export_animation_mode="NLA_TRACKS",
+        export_animation_mode="ACTIONS",
+        export_merge_animation="ACTION",
         export_frame_range=False,
         export_frame_step=1,
         export_force_sampling=False,
