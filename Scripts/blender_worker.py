@@ -475,8 +475,6 @@ def import_model(input_root, input_path, output_path, output_root):
         *PurePosixPath(relative_path).parts,
     )
 
-    scan_source_content(str(resolved_root))
-
     model_directory = os.path.dirname(resolved_input_path)
     texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
     os.makedirs(texture_cache_path, exist_ok=True)

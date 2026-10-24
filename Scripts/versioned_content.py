@@ -202,42 +202,63 @@ class VersionedContentViewCache:
     def __init__(self) -> None:
         self._views: Dict[str, _ResolvedView] = {}
 
+
     def resolve(
         self,
         input_root: str | os.PathLike[str],
         relative_input_path: str | os.PathLike[str],
     ) -> Tuple[Path, str, Optional[int]]:
+        """Resolve one requested file without mirroring or walking the archive."""
         root = Path(input_root).resolve()
 
         if not root.is_dir():
-            raise NotADirectoryError(
-                f"Input root is not a directory: {root}"
-            )
+            raise NotADirectoryError(f"Input root is not a directory: {root}")
 
         logical_relative, desired_version = split_versioned_relative(
             relative_input_path
         )
+        logical_path = root.joinpath(*PurePosixPath(logical_relative).parts)
 
-        key = os.path.normcase(str(root))
-        view = self._views.get(key)
+        if desired_version is not None:
+            container = logical_path
+            variants = _find_variants(container)
 
-        if view is None:
-            view = self._build_view(root, desired_version)
-            self._views[key] = view
-        else:
-            view.activate_version(desired_version)
+            if variants is None:
+                raise FileNotFoundError(
+                    f"Version container has no recognized variants: {container}"
+                )
 
-        logical_parts = PurePosixPath(logical_relative).parts
-        resolved_path = view.root.joinpath(*logical_parts)
-
-        if not resolved_path.is_file():
-            raise FileNotFoundError(
-                "The version-resolved asset is missing: "
-                f"{logical_relative!r} "
-                f"(context version {desired_version!r})."
+            selected = (
+                desired_version
+                if desired_version in variants
+                else choose_version(variants.keys(), desired_version)
             )
 
-        return view.root, logical_relative, desired_version
+            if selected is None:
+                raise FileNotFoundError(
+                    f"No version <= {desired_version} exists in {container}"
+                )
+
+            physical_path = variants[selected]
+        else:
+            if logical_path.is_file():
+                physical_path = logical_path
+            else:
+                variants = _find_variants(logical_path)
+                if variants is None:
+                    raise FileNotFoundError(
+                        f"Asset does not exist: {logical_path}"
+                    )
+
+                selected = choose_version(variants.keys(), None)
+                if selected is None:
+                    raise FileNotFoundError(
+                        f"No usable variants found in {logical_path}"
+                    )
+
+                physical_path = variants[selected]
+
+        return physical_path.parent, physical_path.name, desired_version
 
     def cleanup(self) -> None:
         for view in self._views.values():
