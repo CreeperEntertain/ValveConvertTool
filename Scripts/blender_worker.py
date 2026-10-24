@@ -79,6 +79,9 @@ def clear_scene():
         bpy.ops.object.select_all(action="SELECT")
         bpy.ops.object.delete(use_global=False)
 
+    for action in list(bpy.data.actions):
+        bpy.data.actions.remove(action, do_unlink=True)
+
     for collection_name in (
         "meshes",
         "curves",
@@ -474,7 +477,6 @@ def prepare_materials_for_gltf(mesh_objects):
                     alpha_socket,
                 )
 
-    # Pack loaded images so GLB does not need adjacent image files.
     for image in bpy.data.images:
         try:
             if image.has_data and image.packed_file is None:
@@ -487,7 +489,7 @@ def prepare_materials_for_gltf(mesh_objects):
             )
 
 
-def validate_glb_model(output_path):
+def validate_glb_model(output_path, expected_animation_count=None):
     """Validate GLB 2.0 structure, geometry, and embedded image references."""
     with open(output_path, "rb") as file:
         data = file.read()
@@ -517,6 +519,20 @@ def validate_glb_model(output_path):
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Invalid GLB JSON chunk: {exc}") from exc
+
+    animations = document.get("animations", [])
+
+    if not isinstance(animations, list):
+        raise RuntimeError("GLB animation list is invalid.")
+
+    if (
+        expected_animation_count is not None
+        and len(animations) != expected_animation_count
+    ):
+        raise RuntimeError(
+            f"Expected {expected_animation_count} animation clip(s), "
+            f"but the GLB contains {len(animations)}."
+        )
 
     meshes = document.get("meshes", [])
     if not isinstance(meshes, list) or not any(
@@ -566,6 +582,7 @@ def validate_glb_model(output_path):
 
     print(
         f"[model] GLB validated: meshes={len(meshes)}, "
+        f"animations={len(animations)}, "
         f"materials={len(document.get('materials', []))}, "
         f"embedded_images={len(document.get('images', []))}",
         flush=True,
@@ -1173,6 +1190,97 @@ def stage_versioned_model(input_root, input_path):
         raise
 
 
+def prepare_animation_tracks_for_gltf(armature_objects, actions):
+    """Put each imported SourceIO Action on its own NLA track."""
+    if not actions:
+        print("[model] No animation actions were imported.", flush=True)
+        return 0
+
+    armature_objects = [
+        obj for obj in armature_objects
+        if obj.type == "ARMATURE"
+    ]
+
+    if not armature_objects:
+        raise RuntimeError(
+            f"SourceIO imported {len(actions)} animation action(s), "
+            "but no armature is available to export them."
+        )
+
+    tracks_created = 0
+
+    for action in actions:
+        slots = list(getattr(action, "slots", ()))
+        target_armature = None
+        target_slot = None
+
+        for armature in armature_objects:
+            slot = next(
+                (
+                    candidate
+                    for candidate in slots
+                    if getattr(candidate, "name", None) == armature.name
+                ),
+                None,
+            )
+
+            if slot is not None:
+                target_armature = armature
+                target_slot = slot
+                break
+
+        if target_armature is None and len(armature_objects) == 1:
+            target_armature = armature_objects[0]
+            if len(slots) == 1:
+                target_slot = slots[0]
+
+        if target_armature is None:
+            raise RuntimeError(
+                f"Could not determine which armature owns animation "
+                f"action {action.name!r}."
+            )
+
+        if slots and target_slot is None:
+            raise RuntimeError(
+                f"Could not resolve a Blender 5 Action Slot for "
+                f"animation action {action.name!r}."
+            )
+
+        animation_data = target_armature.animation_data_create()
+        track = animation_data.nla_tracks.new()
+        track.name = action.name
+
+        strip = track.strips.new(
+            action.name,
+            float(bpy.context.scene.frame_start),
+            action,
+        )
+
+        if target_slot is not None:
+            if not hasattr(strip, "action_slot"):
+                raise RuntimeError(
+                    "This Blender build cannot assign Action Slots "
+                    "to NLA strips; animation export cannot be guaranteed."
+                )
+            strip.action_slot = target_slot
+
+        strip.blend_type = "REPLACE"
+        strip.extrapolation = "NOTHING"
+        track.mute = False
+        tracks_created += 1
+
+    for armature in armature_objects:
+        if armature.animation_data is not None:
+            armature.animation_data.action = None
+
+    print(
+        f"[model] Prepared {tracks_created} NLA animation track(s).",
+        flush=True,
+    )
+
+    return tracks_created
+
+
 def import_model(input_root, input_path, output_path, output_root):
     from SourceIO.library.shared.content_manager import ContentManager
 
@@ -1183,6 +1291,28 @@ def import_model(input_root, input_path, output_path, output_root):
     )
 
     try:
+        source_mdl_version, source_mdl = _load_mdl_for_pair_check(
+            staged_model
+        )
+
+        advertised_animation_count = 0
+        if (
+            45 <= source_mdl_version <= 49
+            and source_mdl is not None
+        ):
+            advertised_animation_count = sum(
+                1
+                for animation in (
+                    getattr(source_mdl, "anim_descs", ()) or ()
+                )
+                if getattr(animation, "frame_count", 0) > 0
+            )
+
+        actions_before = {
+            action.as_pointer()
+            for action in bpy.data.actions
+        }
+
         resolved_input_path = str(staged_model)
         model_directory = str(staged_model.parent)
 
@@ -1228,7 +1358,8 @@ def import_model(input_root, input_path, output_path, output_root):
                 ],
                 discover_resources=False,
                 import_textures=True,
-                import_animations=False,
+                import_animations=True,
+                import_include_animations=True,
             )
 
     finally:
@@ -1239,6 +1370,27 @@ def import_model(input_root, input_path, output_path, output_root):
             f"SourceIO 5.5.4 cancelled the MDL import for {input_path}. "
             "Check the model's required VVD/VTX companion files and the "
             "SourceIO error immediately preceding this message."
+        )
+
+    imported_actions = [
+        action
+        for action in bpy.data.actions
+        if action.as_pointer() not in actions_before
+    ]
+
+    print(
+        f"[model] MDL animation descriptors={advertised_animation_count}; "
+        f"imported actions={len(imported_actions)}",
+        flush=True,
+    )
+
+    if advertised_animation_count > 0 and not imported_actions:
+        raise RuntimeError(
+            f"MDL version {source_mdl_version} declares "
+            f"{advertised_animation_count} non-empty animation descriptor(s), "
+            "but SourceIO imported no animation actions. Refusing to "
+            "silently create a static GLB. Check the SourceIO log and "
+            "the model's .ani/include-model dependencies."
         )
 
     mesh_objects = [
@@ -1289,6 +1441,16 @@ def import_model(input_root, input_path, output_path, output_root):
             ):
                 export_objects.append(modifier.object)
 
+    armature_objects = [
+        obj for obj in export_objects
+        if obj.type == "ARMATURE"
+    ]
+
+    expected_animation_count = prepare_animation_tracks_for_gltf(
+        armature_objects,
+        imported_actions,
+    )
+
     bpy.ops.object.select_all(action="DESELECT")
     for obj in export_objects:
         obj.select_set(True)
@@ -1301,7 +1463,11 @@ def import_model(input_root, input_path, output_path, output_root):
         export_format="GLB",
         export_image_format="AUTO",
         export_materials="EXPORT",
-        export_animations=False,
+        export_animations=True,
+        export_animation_mode="NLA_TRACKS",
+        export_frame_range=False,
+        export_frame_step=1,
+        export_force_sampling=True,
         export_cameras=False,
         export_lights=False,
         export_yup=True,
@@ -1314,7 +1480,10 @@ def import_model(input_root, input_path, output_path, output_root):
     if "CANCELLED" in export_result:
         raise RuntimeError("Blender's glTF exporter cancelled the model export.")
 
-    validate_glb_model(output_path)
+    validate_glb_model(
+        output_path,
+        expected_animation_count=expected_animation_count,
+    )
 
 
 def node_tree_has_image_texture(node_tree, visited=None):
