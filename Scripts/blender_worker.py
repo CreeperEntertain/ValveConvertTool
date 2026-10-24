@@ -123,7 +123,7 @@ def scan_source_content(input_root):
     content_manager = ContentManager()
     content_manager.clean()
 
-    content_roots = {root}
+    content_roots = set()
     unreadable_vpks = []
     walk_errors = []
     mounted_vpk_count = 0
@@ -142,16 +142,20 @@ def scan_source_content(input_root):
     ):
         directory = os.path.abspath(directory)
 
-        child_names = {name.casefold() for name in dirnames}
-        if child_names.intersection(content_directory_names):
-            content_roots.add(directory)
-
-        has_vpk = any(
-            filename.casefold().endswith(".vpk")
-            for filename in filenames
+        relative_parts = (
+            []
+            if directory == root
+            else os.path.relpath(directory, root).split(os.sep)
         )
-        if has_vpk:
-            content_roots.add(directory)
+        inside_content_tree = any(
+            part.casefold() in content_directory_names
+            for part in relative_parts
+        )
+
+        if not inside_content_tree:
+            child_names = {name.casefold() for name in dirnames}
+            if child_names.intersection(content_directory_names):
+                content_roots.add(directory)
 
         for filename in filenames:
             if not filename.casefold().endswith(".vpk"):
@@ -179,6 +183,9 @@ def scan_source_content(input_root):
                     unreadable_vpks.append((archive_path, str(exc)))
 
     mounted_roots = []
+
+    if not content_roots:
+        content_roots.add(root)
 
     for game_root in sorted(
         content_roots,
