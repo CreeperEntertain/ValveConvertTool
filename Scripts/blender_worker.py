@@ -237,13 +237,35 @@ def scan_source_content(input_root):
 
 
 def reset_sourceio_content_state(content_manager):
-    """
-    Reset per-import state without unmounting SourceIO content.
-    """
+    """Reset per-import state without unmounting SourceIO content."""
     content_manager.first_import = None
     content_manager.priority_list = None
     content_manager._cache.clear()
     content_manager._clear_meta_caches()
+
+
+def preflight_vtf(input_path):
+    """Verify SourceIO 5.5.4 can decode a VTF before calling its Blender operator."""
+    import numpy as np
+    from SourceIO.library.utils.pylib.vtf import load_vtf_texture
+
+    try:
+        with open(input_path, "rb") as texture_file:
+            vtf_data = texture_file.read()
+
+        pixel_data, width, height, is_float = load_vtf_texture(vtf_data)
+
+        if pixel_data is None or width <= 0 or height <= 0:
+            raise ValueError("The native decoder returned no pixel data or invalid dimensions.")
+
+        dtype = np.float32 if is_float else np.uint8
+        np.frombuffer(pixel_data, dtype=dtype).reshape(height, width, 4)
+
+    except Exception as exc:
+        raise UnsupportedTextureError(
+            f"SourceIO 5.5.4 rejected this VTF during preflight; "
+            f"the Blender import operator was not called: {exc}"
+        ) from exc
 
 
 def import_vtf(input_root, input_path, output_path):
@@ -923,6 +945,7 @@ def main():
 
             clear_scene()
             if asset_type == "texture":
+                preflight_vtf(input_path)
                 import_vtf(input_root, input_path, output_path)
             elif asset_type == "model":
                 import_model(input_root, input_path, output_path, output_root)
