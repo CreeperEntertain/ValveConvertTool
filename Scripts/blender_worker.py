@@ -6,6 +6,7 @@ import traceback
 import atexit
 import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -69,26 +70,46 @@ def get_relative_input_path(input_root, input_path):
     return relative.replace("\\", "/")
 
 
-def get_texture_cache_path(input_root, input_path, output_root):
-    """Mirror the source game's materials folder in the output tree."""
-    from SourceIO.library.utils.path_utilities import get_mod_path
-    from SourceIO.library.utils.tiny_path import TinyPath
+def get_texture_cache_path(
+    input_root,
+    input_path,
+    output_root,
+    source_game_root=None,
+):
+    """Return the output materials cache matching the source game's root."""
+    if source_game_root is None:
+        from SourceIO.library.utils.path_utilities import get_mod_path
+        from SourceIO.library.utils.tiny_path import TinyPath
 
-    source_directory = os.path.dirname(os.path.abspath(input_path))
-    game_root = os.path.abspath(str(get_mod_path(TinyPath(source_directory))))
-
-    expected_game_dirs = ("materials", "maps", "models", "elements")
-    if (
-        not os.path.isdir(game_root)
-        or not any(
-            os.path.isdir(os.path.join(game_root, name))
-            for name in expected_game_dirs
+        source_directory = os.path.dirname(os.path.abspath(input_path))
+        game_root = os.path.abspath(
+            str(get_mod_path(TinyPath(source_directory)))
         )
-    ):
-        game_root = os.path.abspath(input_root)
+
+        expected_game_dirs = (
+            "materials",
+            "maps",
+            "models",
+            "elements",
+        )
+
+        if (
+            not os.path.isdir(game_root)
+            or not any(
+                os.path.isdir(os.path.join(game_root, name))
+                for name in expected_game_dirs
+            )
+        ):
+            game_root = os.path.abspath(input_root)
+
+    else:
+        game_root = os.path.abspath(str(source_game_root))
 
     try:
-        relative_game_root = os.path.relpath(game_root, os.path.abspath(input_root))
+        relative_game_root = os.path.relpath(
+            game_root,
+            os.path.abspath(input_root),
+        )
     except ValueError:
         relative_game_root = os.curdir
 
@@ -98,7 +119,13 @@ def get_texture_cache_path(input_root, input_path, output_root):
     ):
         relative_game_root = os.curdir
 
-    return os.path.abspath(os.path.join(output_root, relative_game_root, "materials"))
+    return os.path.abspath(
+        os.path.join(
+            output_root,
+            relative_game_root,
+            "materials",
+        )
+    )
 
 
 def pack_used_images():
@@ -110,148 +137,6 @@ def pack_used_images():
                 image.pack()
         except Exception as exc:
             print(f"Warning: unable to pack image {image.name}: {exc}", flush=True)
-
-
-def scan_source_content(input_root):
-    """
-    Mount game-specific loose-file roots and readable VPK archives
-    without invoking SourceIO's automatic game detector.
-    """
-    from SourceIO.library.shared.content_manager import ContentManager
-    from SourceIO.library.shared.content_manager.providers import register_provider
-    from SourceIO.library.shared.content_manager.providers.loose_files import (
-        LooseFilesContentProvider,
-    )
-    from SourceIO.library.shared.content_manager.providers.vpk_provider import (
-        VPKContentProvider,
-    )
-    from SourceIO.library.utils.tiny_path import TinyPath
-    from SourceIO.blender_bindings.utils.resource_utils import (
-        serialize_mounted_content,
-    )
-
-    root = os.path.abspath(input_root)
-
-    if not os.path.isdir(root):
-        raise RuntimeError(
-            f"Cannot mount SourceIO content because the input root "
-            f"is not a directory: {root}"
-        )
-
-    content_manager = ContentManager()
-    content_manager.clean()
-
-    content_roots = set()
-    unreadable_vpks = []
-    walk_errors = []
-    mounted_vpk_count = 0
-    vpk_signature = b"\x34\x12\xAA\x55"
-
-    content_directory_names = {
-        "materials",
-        "models",
-        "maps",
-        "elements",
-    }
-
-    for directory, dirnames, filenames in os.walk(
-        root,
-        onerror=walk_errors.append,
-    ):
-        directory = os.path.abspath(directory)
-
-        relative_parts = (
-            []
-            if directory == root
-            else os.path.relpath(directory, root).split(os.sep)
-        )
-        inside_content_tree = any(
-            part.casefold() in content_directory_names
-            for part in relative_parts
-        )
-
-        if not inside_content_tree:
-            child_names = {name.casefold() for name in dirnames}
-            if child_names.intersection(content_directory_names):
-                content_roots.add(directory)
-
-        for filename in filenames:
-            if not filename.casefold().endswith(".vpk"):
-                continue
-
-            archive_path = os.path.join(directory, filename)
-
-            try:
-                with open(archive_path, "rb") as archive_file:
-                    signature = archive_file.read(4)
-            except OSError as exc:
-                if len(unreadable_vpks) < 5:
-                    unreadable_vpks.append((archive_path, str(exc)))
-                continue
-
-            if signature != vpk_signature:
-                continue
-
-            try:
-                provider = VPKContentProvider(TinyPath(archive_path))
-                content_manager.add_child(register_provider(provider))
-                mounted_vpk_count += 1
-            except Exception as exc:
-                if len(unreadable_vpks) < 5:
-                    unreadable_vpks.append((archive_path, str(exc)))
-
-    mounted_roots = []
-
-    if not content_roots:
-        content_roots.add(root)
-
-    for game_root in sorted(
-        content_roots,
-        key=lambda path: (path.count(os.sep), path.casefold()),
-    ):
-        provider = LooseFilesContentProvider(TinyPath(game_root))
-        content_manager.add_child(register_provider(provider))
-        mounted_roots.append(game_root)
-
-    serialize_mounted_content(content_manager)
-
-    print(
-        f"[startup] SourceIO content mounted directly: "
-        f"loose roots={len(mounted_roots)}; "
-        f"VPK archives={mounted_vpk_count}",
-        flush=True,
-    )
-
-    for game_root in mounted_roots[:10]:
-        print(
-            f"[startup] SourceIO loose root: {game_root}",
-            flush=True,
-        )
-
-    if len(mounted_roots) > 10:
-        print(
-            f"[startup] Additional loose roots: {len(mounted_roots) - 10}",
-            flush=True,
-        )
-
-    if walk_errors:
-        print(
-            f"[startup] Warning: {len(walk_errors)} directory scan error(s) "
-            f"occurred while locating game roots and VPK archives.",
-            flush=True,
-        )
-
-    if unreadable_vpks:
-        print(
-            f"[startup] Warning: some VPK archives could not be mounted "
-            f"(showing up to {len(unreadable_vpks)}):",
-            flush=True,
-        )
-        for archive_path, error in unreadable_vpks:
-            print(
-                f"[startup] Skipped VPK: {archive_path}: {error}",
-                flush=True,
-            )
 
 
 def reset_sourceio_content_state(content_manager):
@@ -470,171 +355,327 @@ def validate_obj_textures(output_path):
 
 
 def resolve_dependency_file(game_root, relative_path, model_version):
-    """Resolve one dependency without scanning unrelated archive directories."""
-    logical_path = Path(game_root).joinpath(
-        *PurePosixPath(relative_path.replace("\\", "/")).parts
+    """Resolve one dependency on demand; never walk unrelated archive paths."""
+    relative = PurePosixPath(
+        str(relative_path).replace("\\", "/")
     )
+
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+
+    logical_path = Path(game_root).joinpath(*relative.parts)
 
     if logical_path.is_file():
         return logical_path
 
     variants = _find_variants(logical_path)
+
     if not variants:
         return None
 
-    selected = choose_version(variants.keys(), model_version)
-    if selected is None:
-        return None
+    selected = choose_version(
+        variants.keys(),
+        model_version,
+    )
 
-    return variants[selected]
+    return variants[selected] if selected is not None else None
 
 
-class VersionAwareLooseFilesProvider:
-    """SourceIO provider that resolves versioned paths on demand."""
+def get_versioned_game_context(input_root, input_path):
+    """Return the physical input, game root, logical path, and requested version."""
+    archive_root = Path(input_root).resolve()
+    source_path = Path(input_path).resolve()
 
-    def __new__(cls, *args, **kwargs):
-        from SourceIO.library.shared.content_manager.provider import ContentProvider
+    try:
+        relative_input = source_path.relative_to(archive_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Input file is outside the input directory: {input_path}"
+        ) from exc
 
-        if not hasattr(cls, "_sourceio_base"):
-            class _Provider(cls, ContentProvider):
-                pass
-            cls._sourceio_base = _Provider
-        return object.__new__(cls._sourceio_base)
+    logical_relative, desired_version = split_versioned_relative(
+        relative_input
+    )
+    logical_parts = PurePosixPath(logical_relative).parts
 
-    def __init__(self, game_root, model_version):
-        from SourceIO.library.shared.content_manager.provider import ContentProvider
-        from SourceIO.library.utils.tiny_path import TinyPath
-
-        ContentProvider.__init__(self, TinyPath(str(game_root)))
-        self.game_root = Path(game_root)
-        self.model_version = model_version
-
-    @property
-    def root(self):
-        from SourceIO.library.utils.tiny_path import TinyPath
-        return TinyPath(str(self.game_root))
-
-    @property
-    def name(self):
-        return f"VCTVersioned-{self.game_root.name}"
-
-    @property
-    def steam_id(self):
-        from SourceIO.library.shared.app_id import SteamAppId
-        return SteamAppId.UNKNOWN
-
-    def _resolve(self, filepath):
-        from SourceIO.library.utils.tiny_path import TinyPath
-
-        path = TinyPath(filepath)
-        if path.is_absolute():
-            return Path(str(path)) if Path(str(path)).is_file() else None
-
-        relative = str(path).replace("\\", "/").lstrip("/")
-        if ".." in PurePosixPath(relative).parts:
-            return None
-
-        return resolve_dependency_file(
-            self.game_root,
-            relative,
-            self.model_version,
+    if not logical_parts:
+        raise RuntimeError(
+            f"Cannot determine game root for asset: {input_path}"
         )
 
-    def check(self, filepath):
-        return self._resolve(filepath) is not None
+    content_dir_names = {
+        "materials",
+        "models",
+        "maps",
+        "elements",
+    }
 
-    def find_file(self, filepath):
-        from SourceIO.library.utils import FileBuffer
+    if (
+        logical_parts[0].casefold() in content_dir_names
+        and any(
+            (archive_root / name).is_dir()
+            for name in content_dir_names
+        )
+    ):
+        game_root = archive_root
+        relative_to_game = PurePosixPath(logical_relative).as_posix()
+    else:
+        if len(logical_parts) < 2:
+            raise RuntimeError(
+                f"Cannot determine game root for asset: {input_path}"
+            )
 
-        resolved = self._resolve(filepath)
-        if resolved is None or not resolved.is_file():
-            return None
-        return FileBuffer(resolved)
+        game_root = archive_root / logical_parts[0]
+        relative_to_game = PurePosixPath(
+            *logical_parts[1:]
+        ).as_posix()
 
-    def get_relative_path(self, filepath):
-        from SourceIO.library.utils.tiny_path import TinyPath
+    if not game_root.is_dir():
+        raise RuntimeError(
+            f"Expected game content root does not exist: {game_root}"
+        )
 
-        try:
-            return TinyPath(str(Path(str(filepath)).relative_to(self.game_root)))
-        except (ValueError, OSError):
-            return None
+    return (
+        source_path,
+        game_root,
+        relative_to_game,
+        desired_version,
+    )
 
-    def get_provider_from_path(self, filepath):
-        return self if self.check(filepath) else None
 
-    def get_steamid_from_asset(self, asset_path):
-        return self.steam_id if self.check(asset_path) else None
+def create_version_aware_provider(game_root, model_version):
+    """Build a SourceIO 5.5.4 provider for one game root/version context."""
+    from SourceIO.library.shared.app_id import SteamAppId
+    from SourceIO.library.shared.content_manager.provider import ContentProvider
+    from SourceIO.library.utils import FileBuffer
+    from SourceIO.library.utils.tiny_path import TinyPath
 
-    def glob(self, pattern):
-        return iter()
+    root = Path(game_root).resolve()
+
+    class VersionAwareLooseFilesProvider(ContentProvider):
+        def __init__(self):
+            self.game_root = root
+            self.model_version = model_version
+            super().__init__(TinyPath(str(self.game_root)))
+
+        @property
+        def root(self):
+            return TinyPath(str(self.game_root))
+
+        @property
+        def name(self):
+            version_label = (
+                "latest"
+                if self.model_version is None
+                else str(self.model_version)
+            )
+            return (
+                f"VCTVersioned-{self.game_root.name}"
+                f"-v{version_label}"
+            )
+
+        @property
+        def steam_id(self):
+            return SteamAppId.UNKNOWN
+
+        def _resolve(self, filepath):
+            path = TinyPath(filepath)
+
+            if path.is_absolute():
+                absolute = Path(str(path))
+
+                try:
+                    relative = absolute.relative_to(
+                        self.game_root
+                    ).as_posix()
+                except ValueError:
+                    return None
+
+            else:
+                relative = str(path).replace("\\", "/")
+
+            pure = PurePosixPath(relative)
+
+            if pure.is_absolute() or ".." in pure.parts:
+                return None
+
+            return resolve_dependency_file(
+                self.game_root,
+                pure.as_posix(),
+                self.model_version,
+            )
+
+        def check(self, filepath):
+            resolved = self._resolve(filepath)
+            return resolved is not None and resolved.is_file()
+
+        def find_file(self, filepath):
+            resolved = self._resolve(filepath)
+
+            if resolved is None or not resolved.is_file():
+                return None
+
+            return FileBuffer(TinyPath(str(resolved)))
+
+        def get_relative_path(self, filepath):
+            try:
+                relative = Path(str(filepath)).relative_to(
+                    self.game_root
+                )
+            except (ValueError, OSError):
+                return None
+
+            return TinyPath(relative.as_posix())
+
+        def get_provider_from_path(self, filepath):
+            return self if self.check(filepath) else None
+
+        def get_steamid_from_asset(self, asset_path):
+            return self.steam_id if self.check(asset_path) else None
+
+        def glob(self, pattern):
+            return iter(())
+
+    return VersionAwareLooseFilesProvider()
+
+
+def _mounted_resource_collections(scene):
+    """Return the legacy and/or grouped SourceIO mounted-resource collections."""
+    result = []
+    props = getattr(scene, "sourceio_props", None)
+
+    candidates = [
+        (
+            getattr(props, "mounted_resources", None)
+            if props is not None
+            else None
+        ),
+        getattr(scene, "mounted_resources", None),
+    ]
+
+    for collection in candidates:
+        if (
+            collection is not None
+            and all(collection is not existing for existing in result)
+        ):
+            result.append(collection)
+
+    return result
+
+
+def _clear_blender_collection(collection):
+    for index in reversed(range(len(collection))):
+        collection.remove(index)
+
+
+@contextmanager
+def isolated_versioned_content(content_manager, provider):
+    """Run one SourceIO import with only this version-aware provider mounted."""
+    saved_collections = []
+
+    for collection in _mounted_resource_collections(bpy.context.scene):
+        records = [
+            (item.path, item.name, item.hash)
+            for item in collection
+        ]
+        saved_collections.append((collection, records))
+
+    try:
+        for collection, _ in saved_collections:
+            _clear_blender_collection(collection)
+
+        content_manager.clean()
+        content_manager.add_child(provider)
+        reset_sourceio_content_state(content_manager)
+
+        yield
+
+    finally:
+        content_manager.clean()
+        reset_sourceio_content_state(content_manager)
+
+        for collection, records in saved_collections:
+            _clear_blender_collection(collection)
+
+            for path, name, resource_hash in records:
+                item = collection.add()
+                item.path = path
+                item.name = name
+                item.hash = resource_hash
 
 
 def stage_versioned_model(input_root, input_path):
     """Stage one MDL and its version-matched companions under normal filenames."""
-    archive_root = Path(input_root).resolve()
-    source_path = Path(input_path).resolve()
-    relative_input = source_path.relative_to(archive_root).as_posix()
-
-    logical_relative, model_version = split_versioned_relative(relative_input)
-    logical_parts = PurePosixPath(logical_relative).parts
-
-    if len(logical_parts) < 2:
-        raise RuntimeError(f"Cannot determine game root for model: {input_path}")
-
-    game_root = archive_root / logical_parts[0]
-    if not game_root.is_dir():
-        raise RuntimeError(f"Expected game content root does not exist: {game_root}")
-
-    model_relative_to_game = PurePosixPath(*logical_parts[1:]).as_posix()
-    logical_model_path = game_root.joinpath(
-        *PurePosixPath(model_relative_to_game).parts
+    source_path, game_root, model_relative_to_game, model_version = (
+        get_versioned_game_context(input_root, input_path)
     )
 
     if source_path.is_file():
         physical_model_path = source_path
     else:
         physical_model_path = resolve_dependency_file(
-            game_root, model_relative_to_game, model_version
+            game_root,
+            model_relative_to_game,
+            model_version,
         )
 
     if physical_model_path is None or not physical_model_path.is_file():
-        raise FileNotFoundError(f"Cannot resolve MDL: {input_path}")
+        raise FileNotFoundError(
+            f"Cannot resolve MDL: {input_path}"
+        )
 
     temporary = tempfile.TemporaryDirectory(prefix="vct-model-")
-    staged_root = Path(temporary.name)
-    staged_model = staged_root.joinpath(*PurePosixPath(model_relative_to_game).parts)
-    staged_model.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(physical_model_path, staged_model)
 
-    companion_suffixes = (
-        ".vvd",
-        ".dx70.vtx",
-        ".dx80.vtx",
-        ".dx90.vtx",
-        ".dx11.vtx",
-        ".dx12.vtx",
-        ".vtx",
-        ".phy",
-        ".ani",
-    )
-
-    for suffix in companion_suffixes:
-        relative_companion = str(
-            PurePosixPath(model_relative_to_game).with_suffix(suffix)
+    try:
+        staged_root = Path(temporary.name)
+        staged_model = staged_root.joinpath(
+            *PurePosixPath(model_relative_to_game).parts
         )
-        physical = resolve_dependency_file(
-            game_root, relative_companion, model_version
-        )
-        if physical is None or not physical.is_file():
-            continue
+        staged_model.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(physical_model_path, staged_model)
 
-        staged_companion = staged_root.joinpath(
-            *PurePosixPath(relative_companion).parts
+        companion_suffixes = (
+            ".vvd",
+            ".dx70.vtx",
+            ".dx80.vtx",
+            ".dx90.vtx",
+            ".dx11.vtx",
+            ".dx12.vtx",
+            ".vtx",
+            ".phy",
+            ".ani",
         )
-        staged_companion.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(physical, staged_companion)
 
-    return temporary, staged_model, game_root, model_version
+        model_logical_path = PurePosixPath(model_relative_to_game)
+
+        for suffix in companion_suffixes:
+            companion_relative = model_logical_path.with_suffix(
+                suffix
+            ).as_posix()
+
+            physical = resolve_dependency_file(
+                game_root,
+                companion_relative,
+                model_version,
+            )
+
+            if physical is None or not physical.is_file():
+                continue
+
+            staged_companion = staged_root.joinpath(
+                *PurePosixPath(companion_relative).parts
+            )
+            staged_companion.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            shutil.copy2(physical, staged_companion)
+
+        return temporary, staged_model, game_root, model_version
+
+    except Exception:
+        temporary.cleanup()
+        raise
 
 
 def import_model(input_root, input_path, output_path, output_root):
@@ -642,51 +683,60 @@ def import_model(input_root, input_path, output_path, output_root):
 
     ensure_parent(output_path)
 
-    temporary, staged_model, game_root, model_version = stage_versioned_model(
-        input_root, input_path
+    temporary, staged_model, game_root, model_version = (
+        stage_versioned_model(input_root, input_path)
     )
-
-    resolved_input_path = str(staged_model)
-    model_directory = str(staged_model.parent)
-
-    texture_cache_path = get_texture_cache_path(
-        input_root, input_path, output_root
-    )
-    os.makedirs(texture_cache_path, exist_ok=True)
-    texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
-    os.makedirs(texture_cache_path, exist_ok=True)
-
-    scene = bpy.context.scene
-
-    if hasattr(scene, "sourceio_props"):
-        scene.sourceio_props.TextureCachePath = texture_cache_path
-    elif hasattr(scene, "TextureCachePath"):
-        scene.TextureCachePath = texture_cache_path
-    else:
-        raise RuntimeError(
-            "SourceIO registered neither Scene.sourceio_props nor "
-            "the legacy Scene.TextureCachePath property."
-        )
-
-    print(f"[model] SourceIO texture cache: {texture_cache_path}", flush=True)
-
-    content_manager = ContentManager()
-    versioned_provider = VersionAwareLooseFilesProvider(
-        game_root, model_version
-    )
-    content_manager.add_child(versioned_provider)
-    reset_sourceio_content_state(content_manager)
 
     try:
-        operator_result = bpy.ops.sourceio.mdl(
-            directory=model_directory,
-            files=[{"name": os.path.basename(resolved_input_path)}],
-            discover_resources=False,
-            import_textures=True,
-            import_animations=False,
+        resolved_input_path = str(staged_model)
+        model_directory = str(staged_model.parent)
+
+        texture_cache_path = get_texture_cache_path(
+            input_root,
+            input_path,
+            output_root,
+            source_game_root=game_root,
         )
+        os.makedirs(texture_cache_path, exist_ok=True)
+
+        scene = bpy.context.scene
+
+        if hasattr(scene, "sourceio_props"):
+            scene.sourceio_props.TextureCachePath = texture_cache_path
+        elif hasattr(scene, "TextureCachePath"):
+            scene.TextureCachePath = texture_cache_path
+        else:
+            raise RuntimeError(
+                "SourceIO registered neither Scene.sourceio_props nor "
+                "the legacy Scene.TextureCachePath property."
+            )
+
+        print(
+            f"[model] SourceIO texture cache: {texture_cache_path}",
+            flush=True,
+        )
+
+        content_manager = ContentManager()
+        versioned_provider = create_version_aware_provider(
+            game_root,
+            model_version,
+        )
+
+        with isolated_versioned_content(
+            content_manager,
+            versioned_provider,
+        ):
+            operator_result = bpy.ops.sourceio.mdl(
+                directory=model_directory,
+                files=[
+                    {"name": os.path.basename(resolved_input_path)}
+                ],
+                discover_resources=False,
+                import_textures=True,
+                import_animations=False,
+            )
+
     finally:
-        reset_sourceio_content_state(content_manager)
         temporary.cleanup()
 
     if "CANCELLED" in operator_result:
@@ -697,12 +747,14 @@ def import_model(input_root, input_path, output_path, output_root):
         )
 
     mesh_objects = [
-        obj for obj in bpy.context.scene.objects
+        obj
+        for obj in bpy.context.scene.objects
         if obj.type == "MESH"
         and obj.data is not None
         and len(obj.data.vertices) > 0
         and len(obj.data.polygons) > 0
     ]
+
     if not mesh_objects:
         raise RuntimeError(
             f"SourceIO completed the MDL operator but imported no usable "
@@ -711,16 +763,20 @@ def import_model(input_root, input_path, output_path, output_root):
         )
 
     fallback = bpy.data.materials.get(DEFAULT_MATERIAL)
+
     if fallback is None:
         fallback = bpy.data.materials.new(DEFAULT_MATERIAL)
 
     bpy.ops.object.select_all(action="DESELECT")
+
     for obj in mesh_objects:
         obj.select_set(True)
+
         if len(obj.data.materials) == 0:
             obj.data.materials.append(fallback)
 
     bpy.context.view_layer.objects.active = mesh_objects[0]
+
     bpy.ops.wm.obj_export(
         filepath=output_path,
         export_selected_objects=True,
@@ -806,23 +862,42 @@ def import_bsp(input_root, input_path, output_path, output_root):
     from SourceIO.library.shared.content_manager import ContentManager
 
     if os.path.splitext(input_path)[1].casefold() != ".bsp":
-        raise ValueError("Only an explicit .bsp source may create a .blend output.")
+        raise ValueError(
+            "Only an explicit .bsp source may create a .blend output."
+        )
 
     ensure_parent(output_path)
 
-    relative_path = get_relative_input_path(input_root, input_path)
-    resolved_root, relative_path, map_version = (
-        DEFAULT_VERSIONED_CONTENT_VIEWS.resolve(input_root, relative_path)
+    relative_path = get_relative_input_path(
+        input_root,
+        input_path,
     )
+
+    resolved_root, resolved_filename, map_version = (
+        DEFAULT_VERSIONED_CONTENT_VIEWS.resolve(
+            input_root,
+            relative_path,
+        )
+    )
+
     resolved_input_path = os.path.join(
         str(resolved_root),
-        *PurePosixPath(relative_path).parts,
+        *PurePosixPath(resolved_filename).parts,
     )
 
-    scan_source_content(str(resolved_root))
+    _, game_root, _, _ = get_versioned_game_context(
+        input_root,
+        input_path,
+    )
 
-    texture_cache_path = get_texture_cache_path(input_root, input_path, output_root)
+    texture_cache_path = get_texture_cache_path(
+        input_root,
+        input_path,
+        output_root,
+        source_game_root=game_root,
+    )
     os.makedirs(texture_cache_path, exist_ok=True)
+
     scene = bpy.context.scene
 
     if hasattr(scene, "sourceio_props"):
@@ -836,17 +911,21 @@ def import_bsp(input_root, input_path, output_path, output_root):
         )
 
     content_manager = ContentManager()
-    reset_sourceio_content_state(content_manager)
+    versioned_provider = create_version_aware_provider(
+        game_root,
+        map_version,
+    )
 
-    try:
+    with isolated_versioned_content(
+        content_manager,
+        versioned_provider,
+    ):
         operator_result = bpy.ops.sourceio.bsp(
             filepath=resolved_input_path,
             discover_resources=False,
             import_textures=True,
             use_bvlg=False,
         )
-    finally:
-        reset_sourceio_content_state(content_manager)
 
     if "CANCELLED" in operator_result:
         raise RuntimeError(
@@ -855,11 +934,17 @@ def import_bsp(input_root, input_path, output_path, output_root):
 
     validate_bsp_scene()
     pack_used_images()
-    bpy.ops.wm.save_as_mainfile(filepath=output_path, check_existing=False)
+
+    bpy.ops.wm.save_as_mainfile(
+        filepath=output_path,
+        check_existing=False,
+    )
 
     with open(output_path, "rb") as file:
         if file.read(len(BLEND_SIGNATURE)) != BLEND_SIGNATURE:
-            raise RuntimeError("BSP conversion did not produce a valid Blender project file.")
+            raise RuntimeError(
+                "BSP conversion did not produce a valid Blender project file."
+            )
 
 
 def validate_output(asset_type, output_path):
