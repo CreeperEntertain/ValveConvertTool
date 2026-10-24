@@ -410,18 +410,185 @@ def _material_tree_has_node_type(node_tree, wanted, visited=None):
     return False
 
 
-def _material_channel_has_linked_input(material, channel):
-    """Return True only when a shader's channel has an actual node connection."""
-    tree = getattr(material, "node_tree", None)
-    if tree is None:
-        return False
+def _bake_source_material_channel(obj, material, source_images, role):
+    """Bake a SourceIO material channel before simplifying its node tree."""
+    if not source_images:
+        return None
 
-    for node in _walk_material_nodes(tree):
-        socket = _channel_input_for_shader(node, channel)
-        if socket is not None and socket.is_linked:
-            return True
+    if len(obj.data.uv_layers) == 0:
+        return None
 
-    return False
+    node_tree = material.node_tree
+
+    has_bsdf = _material_tree_has_node_type(
+        node_tree,
+        {
+            "BSDF_PRINCIPLED",
+            "BSDF_DIFFUSE",
+            "BSDF_GLOSSY",
+            "BSDF_ANISOTROPIC",
+        },
+    )
+
+    if role == "normal":
+        if not has_bsdf:
+            return None
+        bake_type = "NORMAL"
+    elif has_bsdf:
+        bake_type = "DIFFUSE"
+    elif _material_tree_has_node_type(node_tree, {"EMISSION"}):
+        bake_type = "EMIT"
+    else:
+        return None
+
+    width = min(
+        4096,
+        max(1, max(int(image.size[0]) for image in source_images)),
+    )
+    height = min(
+        4096,
+        max(1, max(int(image.size[1]) for image in source_images)),
+    )
+
+    image = bpy.data.images.new(
+        name=f"{material.name}_{role}_baked",
+        width=width,
+        height=height,
+        alpha=True,
+        float_buffer=False,
+    )
+    image.use_fake_user = True
+
+    scene = bpy.context.scene
+    old_engine = scene.render.engine
+    old_active = bpy.context.view_layer.objects.active
+    old_selected = list(bpy.context.selected_objects)
+    old_samples = getattr(scene.cycles, "samples", None)
+
+    tree_states = []
+    seen_trees = set()
+
+    target_node = None
+    success = False
+
+    try:
+        for slot in obj.material_slots:
+            other_material = slot.material
+            if (
+                other_material is None
+                or other_material.node_tree is None
+            ):
+                continue
+
+            tree = other_material.node_tree
+            pointer = tree.as_pointer()
+
+            if pointer in seen_trees:
+                continue
+            seen_trees.add(pointer)
+
+            selected_nodes = [
+                (node, node.select) for node in tree.nodes
+            ]
+            tree_states.append(
+                (tree, tree.nodes.active, selected_nodes)
+            )
+
+            for node in tree.nodes:
+                node.select = False
+            tree.nodes.active = None
+
+        target_node = node_tree.nodes.new("ShaderNodeTexImage")
+        target_node.name = "ValveConvert Bake Target"
+        target_node.label = "ValveConvert Bake Target"
+        target_node.image = image
+        target_node.select = True
+        node_tree.nodes.active = target_node
+
+        for selected_obj in bpy.context.selected_objects:
+            selected_obj.select_set(False)
+
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        scene.render.engine = "CYCLES"
+        if old_samples is not None:
+            scene.cycles.samples = 1
+
+        if bake_type == "NORMAL":
+            bpy.ops.object.bake(
+                type="NORMAL",
+                normal_space="TANGENT",
+                margin=4,
+                use_clear=True,
+            )
+            image.colorspace_settings.name = "Non-Color"
+        else:
+            bake_options = {
+                "type": bake_type,
+                "margin": 4,
+                "use_clear": True,
+            }
+
+            if bake_type == "DIFFUSE":
+                bake_options["pass_filter"] = {"COLOR"}
+
+            bpy.ops.object.bake(**bake_options)
+            image.colorspace_settings.name = "sRGB"
+
+        image.pack()
+        success = True
+
+    except Exception as exc:
+        print(
+            f"[model] Could not bake {role} for "
+            f"{material.name!r}; retaining the original texture "
+            f"selection: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    finally:
+        if target_node is not None:
+            try:
+                node_tree.nodes.remove(target_node)
+            except (ReferenceError, RuntimeError):
+                pass
+
+        for tree, active_node, selected_nodes in tree_states:
+            for node, was_selected in selected_nodes:
+                try:
+                    node.select = was_selected
+                except ReferenceError:
+                    pass
+
+            try:
+                tree.nodes.active = active_node
+            except (ReferenceError, RuntimeError):
+                pass
+
+        scene.render.engine = old_engine
+        if old_samples is not None:
+            scene.cycles.samples = old_samples
+
+        for selected_obj in bpy.context.selected_objects:
+            selected_obj.select_set(False)
+
+        for selected_obj in old_selected:
+            try:
+                selected_obj.select_set(True)
+            except ReferenceError:
+                pass
+
+        try:
+            bpy.context.view_layer.objects.active = old_active
+        except (ReferenceError, RuntimeError):
+            pass
+
+        if not success:
+            bpy.data.images.remove(image, do_unlink=True)
+            return None
+
+    return image
 
 
 def _source_material_parameter(material, wanted_name):
@@ -1085,33 +1252,6 @@ def _bake_source_material_channel(
                 bpy.data.node_groups.remove(group)
 
 
-def _set_principled_material_defaults(principled):
-    """Set predictable PBR defaults before connecting optional baked maps."""
-    defaults = {
-        "Base Color": (1.0, 1.0, 1.0, 1.0),
-        "Metallic": 0.0,
-        "Roughness": 1.0,
-        "IOR": 1.5,
-        "Alpha": 1.0,
-        "Specular IOR Level": 0.5,
-        "Transmission Weight": 0.0,
-        "Subsurface Weight": 0.0,
-        "Coat Weight": 0.0,
-        "Sheen Weight": 0.0,
-        "Anisotropic IOR Level": 0.0,
-        "Emission Color": (0.0, 0.0, 0.0, 1.0),
-        "Emission": (0.0, 0.0, 0.0, 1.0),
-        "Emission Strength": 1.0,
-        "Thin Film Thickness": 0.0,
-        "Thickness": 0.0,
-    }
-
-    for name, value in defaults.items():
-        socket = principled.inputs.get(name)
-        if socket is not None:
-            socket.default_value = value
-
-
 def prepare_materials_for_gltf(mesh_objects):
     """
     Bake SourceIO's evaluated material channels into textures and build
@@ -1194,18 +1334,10 @@ def prepare_materials_for_gltf(mesh_objects):
                 if channel == "alpha" and not has_alpha:
                     continue
 
-                should_bake = (
-                    channel == "base_color"
-                    or _material_uses_channel(source, channel)
-                )
-
-                if channel in {"roughness", "metallic"}:
-                    should_bake = _material_channel_has_linked_input(
-                        source,
-                        channel,
-                    )
-
-                if not should_bake:
+                if (
+                    channel != "base_color"
+                    and not _material_uses_channel(source, channel)
+                ):
                     continue
 
                 baked[channel] = _bake_source_material_channel(
@@ -1268,8 +1400,9 @@ def prepare_materials_for_gltf(mesh_objects):
             output = tree.nodes.new("ShaderNodeOutputMaterial")
             output.location = (500, 0)
 
-            principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-            _set_principled_material_defaults(principled)
+            principled = tree.nodes.new(
+                "ShaderNodeBsdfPrincipled"
+            )
             principled.location = (200, 0)
 
             tree.links.new(
