@@ -681,7 +681,7 @@ def _source_material_alpha_policy(material):
     )
 
 
-    def _walk_material_nodes(node_tree, visited=None):
+def _walk_material_nodes(node_tree, visited=None):
     """Walk a material graph, including nested node groups."""
     if node_tree is None:
         return
