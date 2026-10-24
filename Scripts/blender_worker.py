@@ -412,7 +412,7 @@ def _material_tree_has_node_type(node_tree, wanted, visited=None):
 
 def _bake_source_material_channel(obj, material, source_images, role):
     """Bake a SourceIO material channel before simplifying its node tree."""
-    if not source_images or not material.use_nodes:
+    if not source_images:
         return None
 
     if len(obj.data.uv_layers) == 0:
@@ -476,7 +476,6 @@ def _bake_source_material_channel(obj, material, source_images, role):
             other_material = slot.material
             if (
                 other_material is None
-                or not other_material.use_nodes
                 or other_material.node_tree is None
             ):
                 continue
@@ -1107,7 +1106,6 @@ def _bake_source_material_channel(
     seen_trees = set()
 
     try:
-        temporary_material.use_nodes = True
         created_groups = _clone_material_groups(
             temporary_material.node_tree
         )
@@ -1145,7 +1143,6 @@ def _bake_source_material_channel(
 
             if (
                 material is None
-                or not material.use_nodes
                 or material.node_tree is None
             ):
                 continue
@@ -1277,8 +1274,6 @@ def prepare_materials_for_gltf(mesh_objects):
             if source is None:
                 continue
 
-            source.use_nodes = True
-
             source_nodes = list(
                 _walk_material_nodes(source.node_tree)
             )
@@ -1396,7 +1391,6 @@ def prepare_materials_for_gltf(mesh_objects):
 
             final_material = source.copy()
             final_material.name = f"{source.name}_glTF"
-            final_material.use_nodes = True
 
             slot.material = final_material
 
@@ -2614,7 +2608,7 @@ def sanitize_scene_for_gltf(mesh_objects, export_objects):
     }
 
     for material in materials:
-        if not material.use_nodes or material.node_tree is None:
+        if material.node_tree is None:
             continue
 
         for node in material.node_tree.nodes:
@@ -3217,7 +3211,7 @@ def validate_bsp_scene():
 
     textured_materials = [
         material for material in materials
-        if material.use_nodes
+        if material.node_tree is not None
         and node_tree_has_image_texture(material.node_tree)
     ]
 
