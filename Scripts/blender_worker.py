@@ -681,313 +681,879 @@ def _source_material_alpha_policy(material):
     )
 
 
-def prepare_materials_for_gltf(mesh_objects):
-    """Convert SourceIO materials to glTF-compatible Principled BSDF materials."""
-    for obj in mesh_objects:
-        if len(obj.data.uv_layers) == 0:
+    def _walk_material_nodes(node_tree, visited=None):
+    """Walk a material graph, including nested node groups."""
+    if node_tree is None:
+        return
+
+    if visited is None:
+        visited = set()
+
+    pointer = node_tree.as_pointer()
+    if pointer in visited:
+        return
+
+    visited.add(pointer)
+
+    for node in node_tree.nodes:
+        yield node
+
+        if node.type == "GROUP" and node.node_tree is not None:
+            yield from _walk_material_nodes(
+                node.node_tree, visited
+            )
+
+
+def _clone_material_groups(node_tree, cache=None, created=None):
+    """
+    Make nested node groups private to a temporary material.
+
+    Baking modifies a copy of the graph, never SourceIO's original groups.
+    """
+    if cache is None:
+        cache = {}
+
+    if created is None:
+        created = []
+
+    for node in node_tree.nodes:
+        if node.type != "GROUP" or node.node_tree is None:
             continue
 
-        for slot in obj.material_slots:
-            source_material = slot.material
+        original = node.node_tree
+        pointer = original.as_pointer()
+
+        if pointer not in cache:
+            copied = original.copy()
+            cache[pointer] = copied
+            created.append(copied)
+
+            _clone_material_groups(
+                copied, cache, created
+            )
+
+        node.node_tree = cache[pointer]
+
+    return created
+
+
+def _socket_by_names(node, names):
+    for name in names:
+        socket = node.inputs.get(name)
+        if socket is not None:
+            return socket
+
+    return None
+
+
+def _rgba_value(value, fallback):
+    """Convert scalar or color socket values into an RGBA tuple."""
+    try:
+        values = tuple(value)
+    except (TypeError, ValueError):
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError, OverflowError):
+            scalar = fallback
+        return (scalar, scalar, scalar, 1.0)
+
+    if len(values) >= 4:
+        return tuple(float(v) for v in values[:4])
+
+    if len(values) == 3:
+        return (*[float(v) for v in values], 1.0)
+
+    if len(values) == 1:
+        scalar = float(values[0])
+        return (scalar, scalar, scalar, 1.0)
+
+    return (fallback, fallback, fallback, 1.0)
+
+
+def _material_blend_mode(material):
+    """Return OPAQUE, MASK, or BLEND from Blender's material settings."""
+    legacy = getattr(material, "blend_method", "OPAQUE")
+
+    if legacy == "CLIP":
+        return "MASK"
+
+    if legacy in {"BLEND", "HASHED"}:
+        return "BLEND"
+
+    if getattr(material, "surface_render_method", "") == "BLENDED":
+        return "BLEND"
+
+    return "OPAQUE"
+
+
+def _material_uses_channel(material, channel):
+    """
+    Determine whether a channel carries source information worth baking.
+
+    This examines socket connections and shader nodes, not texture filenames.
+    """
+    nodes = list(_walk_material_nodes(material.node_tree))
+
+    if channel == "base_color":
+        return True
+
+    if channel == "normal":
+        for node in nodes:
+            if node.type in {"NORMAL_MAP", "BUMP"}:
+                return True
+
+            if node.type == "BSDF_PRINCIPLED":
+                socket = node.inputs.get("Normal")
+                if socket is not None and socket.is_linked:
+                    return True
+
+        return False
+
+    if channel == "alpha":
+        if _material_blend_mode(material) != "OPAQUE":
+            return True
+
+        for node in nodes:
+            if node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}:
+                return True
+
+            socket = node.inputs.get("Alpha")
+            if socket is not None:
+                if socket.is_linked:
+                    return True
+
+                if _finite_number(
+                    socket.default_value, 1.0
+                ) < 0.99999:
+                    return True
+
+        return False
+
+    if channel == "roughness":
+        for node in nodes:
+            socket = node.inputs.get("Roughness")
+            if socket is None:
+                continue
+
+            if socket.is_linked:
+                return True
+
+            if abs(
+                _finite_number(socket.default_value, 0.5) - 0.5
+            ) > 1e-6:
+                return True
+
+        return False
+
+    if channel == "metallic":
+        for node in nodes:
+            socket = node.inputs.get("Metallic")
+            if socket is None:
+                continue
+
+            if socket.is_linked:
+                return True
+
+            if abs(
+                _finite_number(socket.default_value, 0.0)
+            ) > 1e-6:
+                return True
+
+        return False
+
+    if channel == "emission":
+        for node in nodes:
+            if node.type == "EMISSION":
+                return True
+
+            if node.type != "BSDF_PRINCIPLED":
+                continue
+
+            color = _socket_by_names(
+                node, ("Emission Color", "Emission")
+            )
+            strength = node.inputs.get("Emission Strength")
+
+            if color is not None:
+                if color.is_linked:
+                    return True
+
+                values = _rgba_value(
+                    color.default_value, 0.0
+                )
+                if max(abs(v) for v in values[:3]) > 1e-6:
+                    return True
+
+            if strength is not None and strength.is_linked:
+                return True
+
+        return False
+
+    return False
+
+
+def _bypass_transparency_for_color(node_tree):
+    """
+    Remove direct Transparent-BSDF branches from a color bake.
+
+    Color should be baked as straight RGB. Baking transparency into RGB as well
+    would premultiply the color and produce dark fringes after glTF export.
+    """
+    for node in list(node_tree.nodes):
+        if node.type == "GROUP" and node.node_tree is not None:
+            _bypass_transparency_for_color(node.node_tree)
+
+    for node in list(node_tree.nodes):
+        if node.type == "MIX_SHADER":
+            shader_inputs = (node.inputs[1], node.inputs[2])
+        elif node.type == "ADD_SHADER":
+            shader_inputs = (node.inputs[0], node.inputs[1])
+        else:
+            continue
+
+        linked = []
+        for socket in shader_inputs:
+            links = list(socket.links)
+            linked.append(links[0] if links else None)
+
+        transparent_index = None
+
+        for index, link in enumerate(linked):
+            if (
+                link is not None
+                and link.from_node.type == "BSDF_TRANSPARENT"
+            ):
+                transparent_index = index
+                break
+
+        if transparent_index is None:
+            continue
+
+        other_index = 1 - transparent_index
+        other_link = linked[other_index]
+
+        # Only bypass the blend when its other shader branch is connected.
+        if other_link is None:
+            continue
+
+        replacement_output = other_link.from_socket
+        destinations = [
+            link.to_socket
+            for link in list(node.outputs[0].links)
+        ]
+
+        for link in list(node_tree.links):
+            if link.from_node == node or link.to_node == node:
+                node_tree.links.remove(link)
+
+        for destination in destinations:
+            node_tree.links.new(
+                replacement_output, destination
+            )
+
+        node_tree.nodes.remove(node)
+
+
+def _channel_input_for_shader(node, channel):
+    """Return the source socket and fallback value for one baked channel."""
+    if channel == "base_color":
+        if node.type == "BSDF_PRINCIPLED":
+            socket = node.inputs.get("Base Color")
+        else:
+            socket = node.inputs.get("Color")
+
+        return socket, (0.0, 0.0, 0.0, 1.0)
+
+    if channel == "roughness":
+        return node.inputs.get("Roughness"), 0.5
+
+    if channel == "metallic":
+        return node.inputs.get("Metallic"), 0.0
+
+    if channel == "emission":
+        if node.type == "EMISSION":
+            return node.inputs.get("Color"), (0.0, 0.0, 0.0, 1.0)
+
+        if node.type == "BSDF_PRINCIPLED":
+            return (
+                _socket_by_names(
+                    node, ("Emission Color", "Emission")
+                ),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+
+        return None, (0.0, 0.0, 0.0, 1.0)
+
+    if channel == "alpha":
+        if node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}:
+            return None, 0.0
+
+        return node.inputs.get("Alpha"), 1.0
+
+    return None, 0.0
+
+
+def _replace_shader_leaves_for_bake(node_tree, channel):
+    """
+    Replace surface shader leaves with emission shaders carrying one channel.
+
+    MixShader, AddShader, math nodes, texture nodes, UV transforms and other
+    graph logic remain in place. This is what preserves layered materials.
+    """
+    for node in list(node_tree.nodes):
+        if node.type == "GROUP" and node.node_tree is not None:
+            _replace_shader_leaves_for_bake(
+                node.node_tree, channel
+            )
+
+    if channel == "base_color":
+        _bypass_transparency_for_color(node_tree)
+
+    combiners = {
+        "GROUP",
+        "GROUP_INPUT",
+        "GROUP_OUTPUT",
+        "OUTPUT_MATERIAL",
+        "MIX_SHADER",
+        "ADD_SHADER",
+        "REROUTE",
+    }
+
+    for node in list(node_tree.nodes):
+        if node.type in combiners:
+            continue
+
+        shader_outputs = [
+            socket for socket in node.outputs
+            if socket.type == "SHADER"
+        ]
+        if not shader_outputs:
+            continue
+
+        source_socket, fallback = _channel_input_for_shader(
+            node, channel
+        )
+
+        source_link = None
+        if source_socket is not None and source_socket.is_linked:
+            source_link = source_socket.links[0].from_socket
+
+        if source_link is not None:
+            color_default = (0.0, 0.0, 0.0, 1.0)
+        elif source_socket is not None:
+            color_default = _rgba_value(
+                source_socket.default_value,
+                float(fallback)
+                if isinstance(fallback, (int, float))
+                else 0.0,
+            )
+        else:
+            color_default = _rgba_value(fallback, 0.0)
+
+        # Emission-only materials carry their color through the emission
+        # channel. Their roughness and metallic channels are not meaningful.
+        emission = node_tree.nodes.new("ShaderNodeEmission")
+        emission.label = f"ValveConvert bake: {channel}"
+        emission.inputs["Color"].default_value = color_default
+        emission.inputs["Strength"].default_value = 1.0
+        emission.location = node.location
+
+        if source_link is not None:
+            node_tree.links.new(
+                source_link, emission.inputs["Color"]
+            )
+
+        destinations = [
+            link.to_socket
+            for link in list(node_tree.links)
+            if link.from_node == node
+            and link.from_socket.type == "SHADER"
+        ]
+
+        node_tree.nodes.remove(node)
+
+        for destination in destinations:
+            node_tree.links.new(
+                emission.outputs["Emission"], destination
+            )
+
+
+def _bake_source_material_channel(
+    obj,
+    slot_index,
+    source_material,
+    channel,
+    resolution,
+):
+    """Bake one evaluated channel into a texture."""
+    temporary_material = source_material.copy()
+    created_groups = []
+    image = None
+
+    scene = bpy.context.scene
+    slot = obj.material_slots[slot_index]
+
+    old_material = slot.material
+    old_engine = scene.render.engine
+    old_active_object = bpy.context.view_layer.objects.active
+    old_selected_objects = list(bpy.context.selected_objects)
+    old_samples = scene.cycles.samples
+    old_margin = scene.render.bake.margin
+
+    tree_states = []
+    seen_trees = set()
+
+    try:
+        temporary_material.use_nodes = True
+        created_groups = _clone_material_groups(
+            temporary_material.node_tree
+        )
+
+        if channel != "normal":
+            _replace_shader_leaves_for_bake(
+                temporary_material.node_tree, channel
+            )
+
+        image = bpy.data.images.new(
+            name=f"{source_material.name}_{channel}_bake",
+            width=resolution,
+            height=resolution,
+            alpha=True,
+            float_buffer=False,
+        )
+
+        if channel in {"normal", "roughness", "metallic", "alpha"}:
+            image.colorspace_settings.name = "Non-Color"
+        else:
+            image.colorspace_settings.name = "sRGB"
+
+        target = temporary_material.node_tree.nodes.new(
+            "ShaderNodeTexImage"
+        )
+        target.name = "ValveConvert Bake Target"
+        target.image = image
+        target.select = True
+        temporary_material.node_tree.nodes.active = target
+
+        slot.material = temporary_material
+
+        for material_slot in obj.material_slots:
+            material = material_slot.material
 
             if (
-                source_material is None
-                or not source_material.use_nodes
-                or source_material.node_tree is None
+                material is None
+                or not material.use_nodes
+                or material.node_tree is None
             ):
                 continue
 
-            entries = _collect_material_image_entries(
-                source_material
-            )
+            tree = material.node_tree
+            pointer = tree.as_pointer()
 
-            base_images = _images_for_material_role(
-                entries, "base_color"
-            )
-            normal_images = _images_for_material_role(
-                entries, "normal"
-            )
-
-            needs_base_bake = len(base_images) > 1
-            needs_normal_bake = len(normal_images) > 1
-
-            if not needs_base_bake and not needs_normal_bake:
+            if pointer in seen_trees:
                 continue
 
-            copied_material = source_material.copy()
-            slot.material = copied_material
-            baked_anything = False
-
-            if needs_base_bake:
-                baked_image = _bake_source_material_channel(
-                    obj,
-                    copied_material,
-                    base_images,
-                    "base_color",
-                )
-                if baked_image is not None:
-                    copied_material[
-                        "_valveconvert_baked_base_color"
-                    ] = baked_image.name
-                    baked_anything = True
-                    print(
-                        f"[model] Baked layered base color for "
-                        f"{copied_material.name!r}",
-                        flush=True,
-                    )
-
-            if needs_normal_bake:
-                baked_image = _bake_source_material_channel(
-                    obj,
-                    copied_material,
-                    normal_images,
-                    "normal",
-                )
-                if baked_image is not None:
-                    copied_material[
-                        "_valveconvert_baked_normal"
-                    ] = baked_image.name
-                    baked_anything = True
-                    print(
-                        f"[model] Baked layered normals for "
-                        f"{copied_material.name!r}",
-                        flush=True,
-                    )
-
-            if not baked_anything:
-                slot.material = source_material
-                bpy.data.materials.remove(
-                    copied_material, do_unlink=True
-                )
-
-    materials = {
-        slot.material
-        for obj in mesh_objects
-        for slot in obj.material_slots
-        if slot.material is not None
-    }
-
-    for material in materials:
-        material.use_nodes = True
-        entries = _collect_material_image_entries(material)
-        packed_ids = set()
-
-        for _, image, _ in entries:
-            image_id = image.as_pointer()
-            if image_id in packed_ids:
-                continue
-
-            packed_ids.add(image_id)
-            try:
-                if image.has_data and image.packed_file is None:
-                    image.pack()
-            except Exception as exc:
-                print(
-                    f"[model] Warning: could not pack "
-                    f"{image.name!r}: {exc}",
-                    flush=True,
-                )
-
-        excluded = (
-            "normal", "bump", "rough", "metal", "spec",
-            "emissive", "emission", "alpha", "mask",
-            "envmap", "environment",
-        )
-        base_image = _choose_material_image(
-            entries,
-            (
-                "basetexture", "base_texture", "base color",
-                "basecolor", "diffuse", "albedo", "color", "colour",
-            ),
-            excluded,
-        )
-        source_base_image = base_image
-
-        baked_base_name = material.get(
-            "_valveconvert_baked_base_color", ""
-        )
-        if baked_base_name:
-            baked_image = bpy.data.images.get(baked_base_name)
-            if baked_image is not None:
-                base_image = baked_image
-        if base_image is None:
-            base_image = next(
+            seen_trees.add(pointer)
+            tree_states.append(
                 (
-                    image for _, image, label in entries
-                    if not any(token in label.casefold() for token in excluded)
-                ),
-                entries[0][1] if entries else None,
+                    tree,
+                    tree.nodes.active,
+                    [
+                        (node, node.select)
+                        for node in tree.nodes
+                    ],
+                )
             )
 
-        normal_image = _choose_material_image(
-            entries, ("normal", "normalmap", "normal_map", "bump")
-        )
-        baked_normal_name = material.get(
-            "_valveconvert_baked_normal", ""
-        )
-        if baked_normal_name:
-            baked_image = bpy.data.images.get(baked_normal_name)
-            if baked_image is not None:
-                normal_image = baked_image
+            for node in tree.nodes:
+                node.select = False
 
-        roughness_image = _choose_material_image(
-            entries, ("roughness", "rough")
-        )
-        metallic_image = _choose_material_image(
-            entries, ("metallic", "metalness")
-        )
-        emissive_image = _choose_material_image(
-            entries, ("emissive", "emission", "selfillum")
-        )
+            tree.nodes.active = None
 
-        tree = material.node_tree
-        tree.nodes.clear()
+        temporary_material.node_tree.nodes.active = target
+        target.select = True
 
-        output = tree.nodes.new("ShaderNodeOutputMaterial")
-        output.location = (500, 0)
+        for selected in bpy.context.selected_objects:
+            selected.select_set(False)
 
-        principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-        principled.location = (200, 0)
-        tree.links.new(
-            principled.outputs["BSDF"],
-            output.inputs["Surface"],
-        )
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
 
-        def connect_image(image, socket_name, y, non_color=False):
-            if image is None:
-                return None
+        scene.render.engine = "CYCLES"
+        scene.cycles.samples = 1
+        scene.render.bake.margin = 8
 
-            if non_color:
+        if channel == "normal":
+            bpy.ops.object.bake(
+                type="NORMAL",
+                normal_space="TANGENT",
+                margin=8,
+                use_clear=True,
+            )
+        else:
+            bpy.ops.object.bake(
+                type="EMIT",
+                margin=8,
+                use_clear=True,
+            )
+
+        image.pack()
+        return image
+
+    except Exception as exc:
+        if image is not None:
+            bpy.data.images.remove(image, do_unlink=True)
+
+        raise RuntimeError(
+            f"Could not bake {channel!r} for material "
+            f"{source_material.name!r} on object {obj.name!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    finally:
+        slot.material = old_material
+
+        for tree, active_node, node_states in tree_states:
+            for node, selected in node_states:
                 try:
-                    image.colorspace_settings.name = "Non-Color"
-                except Exception:
+                    node.select = selected
+                except ReferenceError:
                     pass
 
-            texture = tree.nodes.new("ShaderNodeTexImage")
-            texture.image = image
-            texture.label = image.name
-            texture.location = (-500, y)
+            try:
+                tree.nodes.active = active_node
+            except (ReferenceError, RuntimeError):
+                pass
 
-            socket = principled.inputs.get(socket_name)
-            if socket is not None:
-                tree.links.new(texture.outputs["Color"], socket)
+        scene.render.engine = old_engine
+        scene.cycles.samples = old_samples
+        scene.render.bake.margin = old_margin
 
-            return texture
+        for selected in bpy.context.selected_objects:
+            selected.select_set(False)
 
-        base_texture_node = connect_image(
-            base_image, "Base Color", 200
+        for selected in old_selected_objects:
+            try:
+                selected.select_set(True)
+            except ReferenceError:
+                pass
+
+        try:
+            bpy.context.view_layer.objects.active = old_active_object
+        except (ReferenceError, RuntimeError):
+            pass
+
+        bpy.data.materials.remove(
+            temporary_material, do_unlink=True
         )
-        connect_image(roughness_image, "Roughness", -100, True)
-        connect_image(metallic_image, "Metallic", -300, True)
 
-        if normal_image is not None:
-            normal_texture = connect_image(
-                normal_image, "__unused__", -500, True
+        for group in reversed(created_groups):
+            if group.users == 0:
+                bpy.data.node_groups.remove(group)
+
+
+def prepare_materials_for_gltf(mesh_objects):
+    """
+    Bake SourceIO's evaluated material channels into textures and build
+    simple glTF-compatible Principled materials.
+    """
+    from array import array
+
+    for obj in mesh_objects:
+        if obj.type != "MESH":
+            continue
+
+        if len(obj.data.uv_layers) == 0:
+            raise RuntimeError(
+                f"Cannot bake material channels for {obj.name!r}: "
+                "the mesh has no UV map."
             )
-            if normal_texture is not None:
-                normal_map = tree.nodes.new("ShaderNodeNormalMap")
-                normal_map.location = (-120, -500)
+
+        for slot_index, slot in enumerate(obj.material_slots):
+            source = slot.material
+            if source is None:
+                continue
+
+            source.use_nodes = True
+
+            source_nodes = list(
+                _walk_material_nodes(source.node_tree)
+            )
+
+            is_unlit = (
+                not any(
+                    node.type == "BSDF_PRINCIPLED"
+                    for node in source_nodes
+                )
+                and any(
+                    node.type == "EMISSION"
+                    for node in source_nodes
+                )
+            )
+
+            has_alpha = _material_uses_channel(
+                source, "alpha"
+            )
+
+            source_images = [
+                image
+                for _, image in _iter_material_image_nodes(
+                    source.node_tree
+                )
+            ]
+
+            resolution = max(
+                [512]
+                + [
+                    max(
+                        int(image.size[0]),
+                        int(image.size[1]),
+                    )
+                    for image in source_images
+                    if image.size[0] > 0 and image.size[1] > 0
+                ]
+            )
+            resolution = max(64, min(2048, resolution))
+
+            print(
+                f"[material] Baking {source.name!r} on {obj.name!r} "
+                f"at {resolution}x{resolution}",
+                flush=True,
+            )
+
+            baked = {}
+
+            channels = [
+                "base_color",
+                "roughness",
+                "metallic",
+                "emission",
+                "normal",
+                "alpha",
+            ]
+
+            for channel in channels:
+                if channel == "alpha" and not has_alpha:
+                    continue
+
+                if (
+                    channel != "base_color"
+                    and not _material_uses_channel(source, channel)
+                ):
+                    continue
+
+                baked[channel] = _bake_source_material_channel(
+                    obj,
+                    slot_index,
+                    source,
+                    channel,
+                    resolution,
+                )
+
+            base_image = baked["base_color"]
+            alpha_image = baked.get("alpha")
+
+            if alpha_image is not None:
+                if (
+                    tuple(base_image.size)
+                    != tuple(alpha_image.size)
+                ):
+                    raise RuntimeError(
+                        f"Channel bake dimensions differ for "
+                        f"{source.name!r}."
+                    )
+
+                base_pixels = array(
+                    "f", [0.0]
+                ) * len(base_image.pixels)
+
+                alpha_pixels = array(
+                    "f", [0.0]
+                ) * len(alpha_image.pixels)
+
+                base_image.pixels.foreach_get(base_pixels)
+                alpha_image.pixels.foreach_get(alpha_pixels)
+
+                for index in range(0, len(base_pixels), 4):
+                    base_pixels[index + 3] = min(
+                        1.0,
+                        max(0.0, alpha_pixels[index]),
+                    )
+
+                base_image.pixels.foreach_set(base_pixels)
+                base_image.update()
+                base_image.pack()
+
+                bpy.data.images.remove(
+                    alpha_image, do_unlink=True
+                )
+
+            if hasattr(base_image, "alpha_mode"):
+                base_image.alpha_mode = "STRAIGHT"
+
+            final_material = source.copy()
+            final_material.name = f"{source.name}_glTF"
+            final_material.use_nodes = True
+
+            slot.material = final_material
+
+            tree = final_material.node_tree
+            tree.nodes.clear()
+
+            output = tree.nodes.new("ShaderNodeOutputMaterial")
+            output.location = (500, 0)
+
+            principled = tree.nodes.new(
+                "ShaderNodeBsdfPrincipled"
+            )
+            principled.location = (200, 0)
+
+            tree.links.new(
+                principled.outputs["BSDF"],
+                output.inputs["Surface"],
+            )
+
+            def connect_texture(image, socket_name, y):
+                if image is None:
+                    return None
+
+                texture = tree.nodes.new("ShaderNodeTexImage")
+                texture.image = image
+                texture.label = image.name
+                texture.location = (-500, y)
+
+                socket = principled.inputs.get(socket_name)
+                if socket is not None:
+                    tree.links.new(
+                        texture.outputs["Color"], socket
+                    )
+
+                return texture
+
+            if is_unlit:
+                principled.inputs["Base Color"].default_value = (
+                    0.0, 0.0, 0.0, 1.0
+                )
+            else:
+                connect_texture(
+                    base_image, "Base Color", 200
+                )
+
+            if has_alpha:
+                base_texture = next(
+                    (
+                        node for node in tree.nodes
+                        if node.type == "TEX_IMAGE"
+                        and node.image == base_image
+                    ),
+                    None,
+                )
+
+                if base_texture is None:
+                    base_texture = tree.nodes.new(
+                        "ShaderNodeTexImage"
+                    )
+                    base_texture.image = base_image
+                    base_texture.location = (-500, 400)
+
+                alpha_socket = principled.inputs.get("Alpha")
+                if alpha_socket is not None:
+                    tree.links.new(
+                        base_texture.outputs["Alpha"],
+                        alpha_socket,
+                    )
+
+            roughness_image = baked.get("roughness")
+            if roughness_image is not None:
+                roughness_image.colorspace_settings.name = "Non-Color"
+                connect_texture(
+                    roughness_image, "Roughness", -100
+                )
+
+            metallic_image = baked.get("metallic")
+            if metallic_image is not None:
+                metallic_image.colorspace_settings.name = "Non-Color"
+                connect_texture(
+                    metallic_image, "Metallic", -300
+                )
+
+            normal_image = baked.get("normal")
+            if normal_image is not None:
+                normal_image.colorspace_settings.name = "Non-Color"
+
+                normal_texture = tree.nodes.new(
+                    "ShaderNodeTexImage"
+                )
+                normal_texture.image = normal_image
+                normal_texture.location = (-500, -500)
+
+                normal_map = tree.nodes.new(
+                    "ShaderNodeNormalMap"
+                )
+                normal_map.location = (-150, -500)
+
                 tree.links.new(
                     normal_texture.outputs["Color"],
                     normal_map.inputs["Color"],
                 )
-                normal_socket = principled.inputs.get("Normal")
-                if normal_socket is not None:
-                    tree.links.new(
-                        normal_map.outputs["Normal"],
-                        normal_socket,
+                tree.links.new(
+                    normal_map.outputs["Normal"],
+                    principled.inputs["Normal"],
+                )
+
+            emission_image = baked.get("emission")
+            if emission_image is not None:
+                emission_socket = (
+                    principled.inputs.get("Emission Color")
+                    or principled.inputs.get("Emission")
+                )
+                if emission_socket is not None:
+                    connect_texture(
+                        emission_image,
+                        emission_socket.name,
+                        -700,
                     )
 
-        if emissive_image is not None:
-            emission_socket = (
-                "Emission Color"
-                if principled.inputs.get("Emission Color")
-                else "Emission"
-            )
-            connect_image(emissive_image, emission_socket, -700)
+            blend_mode = _material_blend_mode(source)
 
-        (
-            use_texture_alpha,
-            use_vertex_alpha,
-            alpha_factor,
-            alpha_test,
-            alpha_cutoff,
-        ) = _source_material_alpha_policy(material)
+            if has_alpha:
+                if blend_mode == "OPAQUE":
+                    blend_mode = "BLEND"
 
-        alpha_socket = principled.inputs.get("Alpha")
+                if blend_mode == "BLEND":
+                    if hasattr(final_material, "blend_method"):
+                        final_material.blend_method = "BLEND"
+                    if hasattr(
+                        final_material, "surface_render_method"
+                    ):
+                        final_material.surface_render_method = "BLENDED"
 
-        if alpha_socket is not None:
-            alpha_socket.default_value = alpha_factor
-            alpha_signals = []
+                elif blend_mode == "MASK":
+                    if hasattr(final_material, "blend_method"):
+                        final_material.blend_method = "CLIP"
+                    if hasattr(
+                        final_material, "surface_render_method"
+                    ):
+                        final_material.surface_render_method = "DITHERED"
 
-            if use_texture_alpha and source_base_image is not None:
-                if source_base_image == base_image:
-                    alpha_node = base_texture_node
-                else:
-                    alpha_node = tree.nodes.new("ShaderNodeTexImage")
-                    alpha_node.image = source_base_image
-                    alpha_node.label = source_base_image.name
+                    if hasattr(final_material, "alpha_threshold"):
+                        final_material.alpha_threshold = (
+                            getattr(source, "alpha_threshold", 0.5)
+                        )
 
-                alpha_output = alpha_node.outputs.get("Alpha")
-                if alpha_output is not None:
-                    alpha_signals.append(alpha_output)
-
-            if use_vertex_alpha:
-                vertex_color = tree.nodes.new(
-                    "ShaderNodeVertexColor"
-                )
-                alpha_output = vertex_color.outputs.get("Alpha")
-                if alpha_output is not None:
-                    alpha_signals.append(alpha_output)
-
-            if len(alpha_signals) == 2:
-                multiply = tree.nodes.new("ShaderNodeMath")
-                multiply.operation = "MULTIPLY"
-                tree.links.new(
-                    alpha_signals[0], multiply.inputs[0]
-                )
-                tree.links.new(
-                    alpha_signals[1], multiply.inputs[1]
-                )
-                alpha_signal = multiply.outputs[0]
-            elif alpha_signals:
-                alpha_signal = alpha_signals[0]
             else:
-                alpha_signal = None
+                if hasattr(final_material, "blend_method"):
+                    final_material.blend_method = "OPAQUE"
+                if hasattr(
+                    final_material, "surface_render_method"
+                ):
+                    final_material.surface_render_method = "DITHERED"
 
-            if alpha_signal is not None and alpha_factor < 1.0:
-                multiply = tree.nodes.new("ShaderNodeMath")
-                multiply.operation = "MULTIPLY"
-                tree.links.new(alpha_signal, multiply.inputs[0])
-                multiply.inputs[1].default_value = alpha_factor
-                alpha_signal = multiply.outputs[0]
-
-            if alpha_signal is not None and alpha_test:
-                threshold = tree.nodes.new("ShaderNodeMath")
-                threshold.operation = "GREATER_THAN"
-                tree.links.new(alpha_signal, threshold.inputs[0])
-                threshold.inputs[1].default_value = alpha_cutoff
-                alpha_signal = threshold.outputs[0]
-
-            if alpha_signal is not None:
-                tree.links.new(alpha_signal, alpha_socket)
-        if alpha_socket is not None and base_image is not None:
-            alpha_texture = next(
-                (
-                    node for node in tree.nodes
-                    if node.type == "TEX_IMAGE"
-                    and node.image == base_image
-                ),
-                None,
+            print(
+                f"[material] Finished {source.name!r}: "
+                f"{', '.join(sorted(baked))}",
+                flush=True,
             )
-            if (
-                alpha_texture is not None
-                and alpha_texture.outputs.get("Alpha") is not None
-            ):
-                tree.links.new(
-                    alpha_texture.outputs["Alpha"],
-                    alpha_socket,
-                )
 
     for image in bpy.data.images:
         try:
@@ -995,7 +1561,7 @@ def prepare_materials_for_gltf(mesh_objects):
                 image.pack()
         except Exception as exc:
             print(
-                f"[model] Warning: could not pack "
+                f"[material] Warning: could not pack "
                 f"{image.name!r}: {exc}",
                 flush=True,
             )
