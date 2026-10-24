@@ -1189,6 +1189,315 @@ def stage_versioned_model(input_root, input_path):
         _cleanup_staging_directory(temporary)
         raise
 
+     
+def load_source1_animation_data(mdl, mdl_buffer, content_manager, model_path):
+    """Decode Source 1 animations directly through SourceIO's data parser."""
+    from SourceIO.library.models.mdl.load_animations import (
+        load_animations_from_mdl,
+    )
+    from SourceIO.library.utils.tiny_path import TinyPath
+
+    animations = []
+    visited = set()
+    descriptor_count = 0
+
+    def parse_mdl(buffer):
+        buffer.seek(0)
+        ident, version = buffer.read_fmt("4sI")
+        buffer.seek(0)
+
+        if ident != b"IDST":
+            return version, None
+
+        if version == 36:
+            from SourceIO.library.models.mdl.v36 import MdlV36
+            parser = MdlV36
+        elif 37 <= version <= 44:
+            from SourceIO.library.models.mdl.v44 import MdlV44
+            parser = MdlV44
+        elif 45 <= version <= 49:
+            from SourceIO.library.models.mdl.v49 import MdlV49
+            parser = MdlV49
+        else:
+            return version, None
+
+        return version, parser.from_buffer(buffer)
+
+    def visit(current_mdl, current_buffer, current_path, depth=0):
+        nonlocal descriptor_count
+
+        if depth > 16:
+            print(
+                f"[model] Animation include depth limit reached at "
+                f"{current_path}",
+                flush=True,
+            )
+            return
+
+        logical_path = PurePosixPath(
+            str(current_path).replace("\\", "/")
+        )
+        key = logical_path.as_posix().casefold()
+
+        if key in visited:
+            return
+        visited.add(key)
+
+        descriptors = getattr(current_mdl, "anim_descs", ()) or ()
+        descriptor_count += sum(
+            1
+            for descriptor in descriptors
+            if getattr(descriptor, "frame_count", 0) > 0
+        )
+
+        try:
+            current_buffer.seek(0)
+            decoded = load_animations_from_mdl(
+                current_mdl,
+                current_buffer,
+                content_manager,
+                TinyPath(logical_path.as_posix()),
+            )
+
+            for animation in decoded or ():
+                if (
+                    getattr(animation, "frame_count", 0) > 0
+                    and getattr(animation, "frames", None)
+                ):
+                    animations.append((logical_path.as_posix(), animation))
+
+        except Exception as exc:
+            print(
+                f"[model] Could not decode animations in "
+                f"{logical_path}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+        for include in getattr(current_mdl, "include_models", ()) or ():
+            include_name = str(include).replace("\\", "/")
+            include_path = PurePosixPath(include_name)
+
+            candidates = [include_path]
+            relative_candidate = logical_path.parent / include_path.name
+            if relative_candidate not in candidates:
+                candidates.append(relative_candidate)
+
+            include_buffer = None
+            resolved_path = None
+
+            for candidate in candidates:
+                try:
+                    include_buffer = content_manager.find_file(
+                        TinyPath(candidate.as_posix())
+                    )
+                except Exception:
+                    include_buffer = None
+
+                if include_buffer is not None:
+                    resolved_path = candidate
+                    break
+
+            if include_buffer is None:
+                print(
+                    f"[model] Animation include not found: {include_name}",
+                    flush=True,
+                )
+                continue
+
+            try:
+                include_buffer.seek(0)
+                _, include_mdl = parse_mdl(include_buffer)
+
+                if include_mdl is None:
+                    print(
+                        f"[model] Unsupported animation include: "
+                        f"{resolved_path}",
+                        flush=True,
+                    )
+                    continue
+
+                visit(
+                    include_mdl,
+                    include_buffer,
+                    resolved_path,
+                    depth + 1,
+                )
+
+            except Exception as exc:
+                print(
+                    f"[model] Could not read animation include "
+                    f"{resolved_path}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            finally:
+                close = getattr(include_buffer, "close", None)
+                if callable(close):
+                    close()
+
+    visit(mdl, mdl_buffer, model_path)
+    return animations, descriptor_count
+
+
+def create_source1_animation_actions(armature_objects, animation_sources, scale=1.0):
+    """Build Blender 5-compatible slotted Actions from decoded SourceIO data."""
+    from math import radians
+    from mathutils import Euler, Matrix, Quaternion, Vector
+    from SourceIO.blender_bindings.utils.bpy_utils import ActionCurveFactory
+
+    armatures = [
+        obj for obj in armature_objects
+        if obj.type == "ARMATURE" and obj.data is not None
+    ]
+    if not armatures:
+        return []
+
+    root_rotation = Euler(
+        (0.0, 0.0, radians(-90.0))
+    ).to_matrix().to_4x4()
+
+    created_actions = []
+
+    for model_path, animation in animation_sources:
+        frame_count = int(getattr(animation, "frame_count", 0))
+        bone_frames = getattr(animation, "frames", {}) or {}
+
+        if frame_count <= 0 or not bone_frames:
+            continue
+
+        armature = max(
+            armatures,
+            key=lambda obj: sum(
+                1 for name in bone_frames
+                if obj.data.bones.get(name) is not None
+            ),
+        )
+
+        matching_bones = [
+            name for name in bone_frames
+            if armature.data.bones.get(name) is not None
+        ]
+        if not matching_bones:
+            print(
+                f"[model] Skipping animation {animation.name!r} from "
+                f"{model_path}: no matching bones in the imported rig",
+                flush=True,
+            )
+            continue
+
+        action_name = (
+            f"{PurePosixPath(model_path).stem}_{animation.name}"
+        )
+        action = bpy.data.actions.new(name=action_name)
+        action["source_fps"] = float(
+            getattr(animation, "fps", 0.0) or 30.0
+        )
+
+        factory = ActionCurveFactory(action, armature)
+        curve_count = 0
+
+        for bone_name, frames in bone_frames.items():
+            bone = armature.data.bones.get(bone_name)
+            if bone is None or frames is None:
+                continue
+
+            count = min(frame_count, len(frames))
+            if count <= 0:
+                continue
+
+            parent = bone.parent
+            parent_rest = (
+                parent.matrix_local.copy()
+                if parent is not None
+                else Matrix.Identity(4)
+            )
+            rest_inverse = bone.matrix_local.inverted()
+
+            positions = [[0.0] * count for _ in range(3)]
+            rotations = [[0.0] * count for _ in range(4)]
+            last_quaternion = None
+
+            for frame_index in range(count):
+                frame_data = frames[frame_index]
+                position = Vector(frame_data["pos"]) * scale
+                x, y, z, w = frame_data["rot"]
+                quaternion = Quaternion((w, x, y, z))
+
+                if getattr(animation, "is_delta", False):
+                    if parent is None:
+                        position = root_rotation @ position
+
+                    location = rest_inverse @ position
+
+                else:
+                    animated_local = (
+                        Matrix.Translation(position)
+                        @ quaternion.to_matrix().to_4x4()
+                    )
+                    armature_space = parent_rest @ animated_local
+
+                    if parent is None:
+                        armature_space = root_rotation @ armature_space
+
+                    basis = rest_inverse @ armature_space
+                    location, quaternion, _ = basis.decompose()
+
+                if (
+                    last_quaternion is not None
+                    and quaternion.dot(last_quaternion) < 0.0
+                ):
+                    quaternion = -quaternion
+
+                last_quaternion = quaternion.copy()
+
+                for axis in range(3):
+                    positions[axis][frame_index] = float(location[axis])
+                for axis in range(4):
+                    rotations[axis][frame_index] = float(quaternion[axis])
+
+            group = factory.new_group(bone_name)
+            data_path = f'pose.bones["{bone_name}"].'
+
+            for property_name, values in (
+                ("location", positions),
+                ("rotation_quaternion", rotations),
+            ):
+                for axis, channel_values in enumerate(values):
+                    curve = factory.new_fcurve(
+                        data_path=data_path + property_name,
+                        index=axis,
+                        group=group,
+                    )
+                    curve.keyframe_points.add(count=count)
+
+                    coordinates = []
+                    for frame_index, value in enumerate(channel_values):
+                        coordinates.extend(
+                            (float(frame_index), float(value))
+                        )
+
+                    curve.keyframe_points.foreach_set(
+                        "co", coordinates
+                    )
+
+                    for point in curve.keyframe_points:
+                        point.interpolation = "LINEAR"
+
+                    curve.update()
+                    curve_count += 1
+
+        if curve_count == 0:
+            bpy.data.actions.remove(action, do_unlink=True)
+            continue
+
+        created_actions.append(action)
+
+    print(
+        f"[model] Created {len(created_actions)} animation action(s) "
+        f"from decoded SourceIO data",
+        flush=True,
+    )
+    return created_actions
+
 
 def prepare_animation_tracks_for_gltf(armature_objects, actions):
     """Put each imported SourceIO Action on its own NLA track."""
@@ -1266,6 +1575,16 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
 
         strip.blend_type = "REPLACE"
         strip.extrapolation = "NOTHING"
+
+        scene = bpy.context.scene
+        scene_fps = (
+            float(scene.render.fps)
+            / max(float(scene.render.fps_base), 1e-6)
+        )
+        source_fps = float(action.get("source_fps", scene_fps))
+        if source_fps > 0.0:
+            strip.scale = scene_fps / source_fps
+
         track.mute = False
         tracks_created += 1
 
@@ -1295,23 +1614,8 @@ def import_model(input_root, input_path, output_path, output_root):
             staged_model
         )
 
-        advertised_animation_count = 0
-        if (
-            45 <= source_mdl_version <= 49
-            and source_mdl is not None
-        ):
-            advertised_animation_count = sum(
-                1
-                for animation in (
-                    getattr(source_mdl, "anim_descs", ()) or ()
-                )
-                if getattr(animation, "frame_count", 0) > 0
-            )
-
-        actions_before = {
-            action.as_pointer()
-            for action in bpy.data.actions
-        }
+        animation_sources = []
+        animation_descriptor_count = 0
 
         resolved_input_path = str(staged_model)
         model_directory = str(staged_model.parent)
@@ -1358,9 +1662,36 @@ def import_model(input_root, input_path, output_path, output_root):
                 ],
                 discover_resources=False,
                 import_textures=True,
-                import_animations=True,
-                import_include_animations=True,
+                import_animations=False,
+                import_include_animations=False,
             )
+
+            if (
+                "CANCELLED" not in operator_result
+                and source_mdl is not None
+                and 36 <= source_mdl_version <= 49
+            ):
+                from SourceIO.library.utils import FileBuffer
+                from SourceIO.library.utils.tiny_path import TinyPath
+
+                logical_model_path = PurePosixPath(
+                    staged_model.relative_to(
+                        Path(temporary.name)
+                    ).as_posix()
+                )
+
+                with FileBuffer(
+                    TinyPath(str(staged_model))
+                ) as animation_buffer:
+                    (
+                        animation_sources,
+                        animation_descriptor_count,
+                    ) = load_source1_animation_data(
+                        source_mdl,
+                        animation_buffer,
+                        content_manager,
+                        logical_model_path,
+                    )
 
     finally:
         _cleanup_staging_directory(temporary)
@@ -1372,26 +1703,11 @@ def import_model(input_root, input_path, output_path, output_root):
             "SourceIO error immediately preceding this message."
         )
 
-    imported_actions = [
-        action
-        for action in bpy.data.actions
-        if action.as_pointer() not in actions_before
-    ]
-
     print(
-        f"[model] MDL animation descriptors={advertised_animation_count}; "
-        f"imported actions={len(imported_actions)}",
+        f"[model] MDL animation descriptors={animation_descriptor_count}; "
+        f"decoded animation clips={len(animation_sources)}",
         flush=True,
     )
-
-    if advertised_animation_count > 0 and not imported_actions:
-        raise RuntimeError(
-            f"MDL version {source_mdl_version} declares "
-            f"{advertised_animation_count} non-empty animation descriptor(s), "
-            "but SourceIO imported no animation actions. Refusing to "
-            "silently create a static GLB. Check the SourceIO log and "
-            "the model's .ani/include-model dependencies."
-        )
 
     mesh_objects = [
         obj
@@ -1441,10 +1757,38 @@ def import_model(input_root, input_path, output_path, output_root):
             ):
                 export_objects.append(modifier.object)
 
-    armature_objects = [
+        armature_objects = [
         obj for obj in export_objects
         if obj.type == "ARMATURE"
     ]
+
+    if (
+        animation_descriptor_count > 0
+        and armature_objects
+        and not animation_sources
+    ):
+        raise RuntimeError(
+            f"SourceIO found {animation_descriptor_count} non-empty "
+            "animation descriptor(s), but its data parser decoded no "
+            "animation clips. Refusing to export a silently static GLB."
+        )
+
+    imported_actions = create_source1_animation_actions(
+        armature_objects,
+        animation_sources,
+        scale=1.0,
+    )
+
+    if (
+        animation_descriptor_count > 0
+        and armature_objects
+        and not imported_actions
+    ):
+        raise RuntimeError(
+            "Animation data was decoded, but no clips could be bound "
+            "to the imported armature. Refusing to export a silently "
+            "static GLB."
+        )
 
     expected_animation_count = prepare_animation_tracks_for_gltf(
         armature_objects,
