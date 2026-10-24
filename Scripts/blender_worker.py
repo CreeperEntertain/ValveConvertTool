@@ -6,6 +6,7 @@ import traceback
 import atexit
 import shutil
 import tempfile
+import gc
 from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -21,6 +22,43 @@ from versioned_content import (
     split_versioned_relative,
 )
 
+_PENDING_STAGING_DIRS = set()
+
+
+def _cleanup_pending_staging_dirs():
+    """Retry temporary-directory cleanup at worker shutdown."""
+    for directory in tuple(_PENDING_STAGING_DIRS):
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            _PENDING_STAGING_DIRS.discard(directory)
+        except OSError as exc:
+            print(
+                f"[shutdown] Could not remove temporary staging directory "
+                f"{directory}: {exc}",
+                flush=True,
+            )
+        else:
+            _PENDING_STAGING_DIRS.discard(directory)
+
+
+def _cleanup_staging_directory(temporary):
+    """Clean staging files without masking the actual import exception."""
+    directory = temporary.name
+
+    gc.collect()
+
+    try:
+        temporary.cleanup()
+    except OSError as exc:
+        _PENDING_STAGING_DIRS.add(directory)
+        print(
+            f"[model] Deferred temporary cleanup for {directory}: {exc}",
+            flush=True,
+        )
+
+
+atexit.register(_cleanup_pending_staging_dirs)
 atexit.register(DEFAULT_VERSIONED_CONTENT_VIEWS.cleanup)
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -381,6 +419,254 @@ def resolve_dependency_file(game_root, relative_path, model_version):
     return variants[selected] if selected is not None else None
 
 
+def _dependency_candidates(game_root, relative_path, desired_version):
+    """Return dependency candidates from newest eligible version downward."""
+    relative = PurePosixPath(
+        str(relative_path).replace("\\", "/")
+    )
+
+    if relative.is_absolute() or ".." in relative.parts:
+        return []
+
+    logical_path = Path(game_root).joinpath(*relative.parts)
+
+    if logical_path.is_file():
+        return [(None, logical_path)]
+
+    variants = _find_variants(logical_path)
+    if not variants:
+        return []
+
+    eligible = [
+        version
+        for version in variants
+        if desired_version is None or version <= desired_version
+    ]
+
+    return [
+        (version, variants[version])
+        for version in sorted(eligible, reverse=True)
+    ]
+
+
+def _load_mdl_for_pair_check(mdl_path):
+    """Parse the MDL with the same SourceIO parser used for model import."""
+    from SourceIO.library.utils import FileBuffer
+    from SourceIO.library.utils.tiny_path import TinyPath
+
+    with FileBuffer(TinyPath(str(mdl_path))) as buffer:
+        ident, mdl_format_version = buffer.read_fmt("4sI")
+        buffer.seek(0)
+
+        if ident != b"IDST":
+            raise ValueError(
+                f"Unexpected MDL identifier {ident!r}: {mdl_path}"
+            )
+
+        if mdl_format_version == 36:
+            from SourceIO.library.models.mdl.v36 import MdlV36
+            parser = MdlV36
+        elif 37 <= mdl_format_version <= 44:
+            from SourceIO.library.models.mdl.v44 import MdlV44
+            parser = MdlV44
+        elif 45 <= mdl_format_version <= 49:
+            from SourceIO.library.models.mdl.v49 import MdlV49
+            parser = MdlV49
+        elif mdl_format_version == 52:
+            from SourceIO.library.models.mdl.v52.mdl_file import MdlV52
+            parser = MdlV52
+        else:
+            return mdl_format_version, None
+
+        mdl = parser.from_buffer(buffer)
+
+    return mdl_format_version, mdl
+
+
+def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
+    """
+    Check whether the candidate VTX indices fit the VVD's model vertex ranges.
+
+    This mirrors the indexing operation that otherwise raises IndexError
+    inside SourceIO's MDL importer.
+    """
+    from SourceIO.blender_bindings.models.common import merge_meshes
+    from SourceIO.library.models.vtx import open_vtx
+    from SourceIO.library.models.vvd import Vvd
+    from SourceIO.library.utils import FileBuffer
+    from SourceIO.library.utils.tiny_path import TinyPath
+
+    with FileBuffer(TinyPath(str(vvd_path))) as buffer:
+        vvd = Vvd.from_buffer(buffer)
+
+    with FileBuffer(TinyPath(str(vtx_path))) as buffer:
+        vtx = open_vtx(buffer)
+
+    all_vertices = vvd.lod_data[0]
+
+    if len(vtx.body_parts) != len(mdl.body_parts):
+        return False, (
+            f"VTX body-part count {len(vtx.body_parts)} does not match "
+            f"MDL count {len(mdl.body_parts)}"
+        )
+
+    checked_models = 0
+
+    for vtx_body_part, body_part in zip(
+        vtx.body_parts,
+        mdl.body_parts,
+    ):
+        if len(vtx_body_part.models) != len(body_part.models):
+            return False, (
+                f"VTX model count does not match MDL body part "
+                f"{body_part.name!r}"
+            )
+
+        for vtx_model, model in zip(
+            vtx_body_part.models,
+            body_part.models,
+        ):
+            if model.vertex_count == 0:
+                continue
+
+            if not vtx_model.model_lods:
+                return False, (
+                    f"VTX model {model.name!r} has no LOD data"
+                )
+
+            start = model.vertex_offset
+            end = start + model.vertex_count
+            model_vertices = all_vertices[start:end]
+
+            if len(model_vertices) != model.vertex_count:
+                return False, (
+                    f"MDL model {model.name!r} requests vertices "
+                    f"[{start}:{end}], but the VVD does not contain "
+                    f"that range"
+                )
+
+            try:
+                vtx_vertices, _, _ = merge_meshes(
+                    model,
+                    vtx_model.model_lods[0],
+                )
+            except Exception as exc:
+                return False, (
+                    f"Could not build VTX indices for {model.name!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            if vtx_vertices:
+                lowest = min(vtx_vertices)
+                highest = max(vtx_vertices)
+
+                if lowest < 0 or highest >= len(model_vertices):
+                    return False, (
+                        f"VTX index range {lowest}..{highest} exceeds "
+                        f"the VVD model vertex range 0.."
+                        f"{len(model_vertices) - 1} for {model.name!r}"
+                    )
+
+            checked_models += 1
+
+    return True, f"checked {checked_models} model(s)"
+
+
+def _select_compatible_model_dependencies(
+    physical_model_path,
+    game_root,
+    model_relative_to_game,
+    model_version,
+):
+    """Select the preferred eligible VVD/VTX pair that passes index checks."""
+    mdl_format_version, mdl = _load_mdl_for_pair_check(
+        physical_model_path
+    )
+
+    model_path = PurePosixPath(model_relative_to_game)
+
+    vvd_candidates = _dependency_candidates(
+        game_root,
+        model_path.with_suffix(".vvd"),
+        model_version,
+    )
+
+    vtx_suffixes = (
+        ".dx90.vtx",
+        ".dx12.vtx",
+        ".vtx",
+        ".dx11.vtx",
+        ".dx80.vtx",
+        ".dx70.vtx",
+    )
+
+    vtx_candidates = []
+
+    for suffix in vtx_suffixes:
+        relative = model_path.with_suffix(suffix)
+
+        for version, path in _dependency_candidates(
+            game_root,
+            relative,
+            model_version,
+        ):
+            vtx_candidates.append((suffix, version, path))
+
+    if not vtx_candidates:
+        raise FileNotFoundError(
+            f"No eligible VTX dependency found for {physical_model_path} "
+            f"at model version {model_version}"
+        )
+
+    if mdl_format_version == 36:
+        selected_vtx = vtx_candidates[0]
+        selected_vvd = vvd_candidates[0] if vvd_candidates else None
+        return selected_vvd, selected_vtx
+
+    if not vvd_candidates:
+        raise FileNotFoundError(
+            f"No eligible VVD dependency found for {physical_model_path} "
+            f"at model version {model_version}"
+        )
+
+    if mdl is None:
+        return vvd_candidates[0], vtx_candidates[0]
+
+    attempted = []
+
+    for vtx_candidate in vtx_candidates:
+        vtx_suffix, vtx_version, vtx_path = vtx_candidate
+
+        for vvd_version, vvd_path in vvd_candidates:
+            try:
+                compatible, reason = _check_vvd_vtx_compatibility(
+                    mdl,
+                    vvd_path,
+                    vtx_path,
+                )
+            except Exception as exc:
+                compatible = False
+                reason = f"{type(exc).__name__}: {exc}"
+
+            if compatible:
+                return (
+                    (vvd_version, vvd_path),
+                    (vtx_suffix, vtx_version, vtx_path),
+                )
+
+            attempted.append(
+                f"VTX {vtx_path} + VVD {vvd_path}: {reason}"
+            )
+
+    details = "\n".join(f"  - {line}" for line in attempted[:8])
+
+    raise RuntimeError(
+        f"No compatible VVD/VTX pair was found for {physical_model_path} "
+        f"at model version {model_version}.\n"
+        f"Tested {len(attempted)} candidate pair(s).\n{details}"
+    )
+
+
 def get_versioned_game_context(input_root, input_path):
     """Return the physical input, game root, logical path, and requested version."""
     archive_root = Path(input_root).resolve()
@@ -605,10 +891,13 @@ def isolated_versioned_content(content_manager, provider):
 
 
 def stage_versioned_model(input_root, input_path):
-    """Stage one MDL and its version-matched companions under normal filenames."""
-    source_path, game_root, model_relative_to_game, model_version = (
-        get_versioned_game_context(input_root, input_path)
-    )
+    """Stage one MDL with a structurally compatible VVD/VTX pair."""
+    (
+        source_path,
+        game_root,
+        model_relative_to_game,
+        model_version,
+    ) = get_versioned_game_context(input_root, input_path)
 
     if source_path.is_file():
         physical_model_path = source_path
@@ -620,61 +909,73 @@ def stage_versioned_model(input_root, input_path):
         )
 
     if physical_model_path is None or not physical_model_path.is_file():
-        raise FileNotFoundError(
-            f"Cannot resolve MDL: {input_path}"
-        )
+        raise FileNotFoundError(f"Cannot resolve MDL: {input_path}")
+
+    selected_vvd, selected_vtx = _select_compatible_model_dependencies(
+        physical_model_path,
+        game_root,
+        model_relative_to_game,
+        model_version,
+    )
 
     temporary = tempfile.TemporaryDirectory(prefix="vct-model-")
 
     try:
         staged_root = Path(temporary.name)
-        staged_model = staged_root.joinpath(
-            *PurePosixPath(model_relative_to_game).parts
-        )
+        logical_model = PurePosixPath(model_relative_to_game)
+
+        staged_model = staged_root.joinpath(*logical_model.parts)
         staged_model.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(physical_model_path, staged_model)
 
-        companion_suffixes = (
-            ".vvd",
-            ".dx70.vtx",
-            ".dx80.vtx",
-            ".dx90.vtx",
-            ".dx11.vtx",
-            ".dx12.vtx",
-            ".vtx",
-            ".phy",
-            ".ani",
-        )
+        if selected_vvd is not None:
+            _, physical_vvd = selected_vvd
+            logical_vvd = logical_model.with_suffix(".vvd")
+            staged_vvd = staged_root.joinpath(*logical_vvd.parts)
+            staged_vvd.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(physical_vvd, staged_vvd)
 
-        model_logical_path = PurePosixPath(model_relative_to_game)
+        vtx_suffix, vtx_version, physical_vtx = selected_vtx
+        logical_vtx = logical_model.with_suffix(vtx_suffix)
+        staged_vtx = staged_root.joinpath(*logical_vtx.parts)
+        staged_vtx.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(physical_vtx, staged_vtx)
 
-        for suffix in companion_suffixes:
-            companion_relative = model_logical_path.with_suffix(
-                suffix
-            ).as_posix()
-
+        for suffix in (".phy", ".ani", ".vvc"):
+            relative = logical_model.with_suffix(suffix).as_posix()
             physical = resolve_dependency_file(
                 game_root,
-                companion_relative,
+                relative,
                 model_version,
             )
 
             if physical is None or not physical.is_file():
                 continue
 
-            staged_companion = staged_root.joinpath(
-                *PurePosixPath(companion_relative).parts
+            staged_optional = staged_root.joinpath(
+                *PurePosixPath(relative).parts
             )
-            staged_companion.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            shutil.copy2(physical, staged_companion)
+            staged_optional.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(physical, staged_optional)
+
+        vvd_description = (
+            f"{selected_vvd[1]} (variant {selected_vvd[0]})"
+            if selected_vvd is not None
+            else "not required by MDL format"
+        )
+
+        print(f"[model] Selected MDL: {physical_model_path}", flush=True)
+        print(f"[model] Selected VVD: {vvd_description}", flush=True)
+        print(
+            f"[model] Selected VTX: {physical_vtx} "
+            f"(variant {vtx_version}; suffix {vtx_suffix})",
+            flush=True,
+        )
 
         return temporary, staged_model, game_root, model_version
 
     except Exception:
-        temporary.cleanup()
+        _cleanup_staging_directory(temporary)
         raise
 
 
@@ -737,7 +1038,7 @@ def import_model(input_root, input_path, output_path, output_root):
             )
 
     finally:
-        temporary.cleanup()
+        _cleanup_staging_directory(temporary)
 
     if "CANCELLED" in operator_result:
         raise RuntimeError(
