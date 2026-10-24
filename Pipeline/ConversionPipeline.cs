@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Buffers.Binary;
+using System.Text.Json;
 using ValveConvertTool.Configuration;
 using ValveConvertTool.Core;
 using ValveConvertTool.Discovery;
@@ -33,7 +34,6 @@ internal sealed class ConversionPipeline(
         var reportPath = Path.Combine(outputRoot, "conversion-report.json");
 
         var expectedOutputs = BuildExpectedOutputs(assets, outputRoot);
-        PreserveReferencedMtlTextures(outputRoot, expectedOutputs);
         CleanOutputDirectory(outputRoot, reportPath, expectedOutputs);
 
         var processedAssetCount = 0;
@@ -64,20 +64,23 @@ internal sealed class ConversionPipeline(
             {
                 var outputRelative = Path.ChangeExtension(asset.RelativePath, outputExtension!);
                 var outputPath = FileSystemService.GetOutputPath(outputRoot, outputRelative);
-                var mtlPath = Path.ChangeExtension(outputPath, ".mtl");
 
                 if (asset.Type == AssetType.Texture && IsValidPng(outputPath))
                 {
                     results.Add(new ConversionResult(
-                        asset.RelativePath, [outputPath], ConversionStatus.Skipped,
+                        asset.RelativePath,
+                        [outputPath],
+                        ConversionStatus.Skipped,
                         "Valid output already exists; conversion skipped."));
                     continue;
                 }
-                if (asset.Type == AssetType.Model && IsValidObjWithMtl(outputPath, mtlPath))
+                if (asset.Type == AssetType.Model && IsValidGlb(outputPath))
                 {
                     results.Add(new ConversionResult(
-                        asset.RelativePath, [outputPath, mtlPath], ConversionStatus.Skipped,
-                        "OBJ geometry and its MTL already exist; conversion skipped."));
+                        asset.RelativePath,
+                        [outputPath],
+                        ConversionStatus.Skipped,
+                        "Valid self-contained GLB already exists; conversion skipped."));
                     continue;
                 }
 
@@ -196,48 +199,6 @@ internal sealed class ConversionPipeline(
         Console.WriteLine($"Report: {reportPath}");
     }
 
-    private static void PreserveReferencedMtlTextures(
-        string outputRoot,
-        HashSet<string> expectedOutputs)
-    {
-        if (!Directory.Exists(outputRoot))
-            return;
-
-        var outputPrefix = Path.GetFullPath(outputRoot)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            + Path.DirectorySeparatorChar;
-
-        foreach (var mtlPath in Directory.EnumerateFiles(outputRoot, "*.mtl", SearchOption.AllDirectories))
-        {
-            var fullMtlPath = Path.GetFullPath(mtlPath);
-            if (!expectedOutputs.Contains(fullMtlPath))
-                continue;
-
-            try
-            {
-                foreach (var line in File.ReadLines(fullMtlPath))
-                {
-                    var texturePath = ResolveMtlTexturePath(fullMtlPath, line);
-                    if (texturePath is null || !File.Exists(texturePath))
-                        continue;
-
-                    var fullTexturePath = Path.GetFullPath(texturePath);
-                    if (fullTexturePath.StartsWith(outputPrefix, StringComparison.OrdinalIgnoreCase))
-                        expectedOutputs.Add(fullTexturePath);
-                }
-            }
-            catch (IOException)
-            {
-                // Damaged old MTLs shouldn't not stop the conversion pipeline
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // Unreadable old MTLs must not shouldn't the conversion pipeline
-            }
-            // I feel like Bart Simpson at the chalkboard writing these
-        }
-    }
-
     private HashSet<string> BuildExpectedOutputs(
         IReadOnlyList<AssetFile> assets,
         string outputRoot)
@@ -253,11 +214,8 @@ internal sealed class ConversionPipeline(
                 case AssetType.Texture when options.ConvertTextures:
                     Add(Path.ChangeExtension(asset.RelativePath, ".png"));
                     break;
-
                 case AssetType.Model when options.ConvertModels:
-                    var objRelative = Path.ChangeExtension(asset.RelativePath, ".obj");
-                    Add(objRelative);
-                    Add(Path.ChangeExtension(objRelative, ".mtl"));
+                    Add(Path.ChangeExtension(asset.RelativePath, ".glb"));
                     break;
                 case AssetType.Map when options.ConvertMaps:
                     Add(Path.ChangeExtension(asset.RelativePath, ".blend"));
@@ -317,7 +275,7 @@ internal sealed class ConversionPipeline(
                 return true;
             case AssetType.Model when options.ConvertModels:
                 jobType = "model";
-                outputExtension = ".obj";
+                outputExtension = ".glb";
                 return true;
             case AssetType.Map when options.ConvertMaps:
                 jobType = "map";
@@ -366,91 +324,99 @@ internal sealed class ConversionPipeline(
         }
     }
 
-    private static bool IsValidObjWithMtl(string objPath, string mtlPath)
+
+    private static bool IsValidGlb(string path)
     {
-        if (!IsNonEmptyFile(objPath) || !IsNonEmptyFile(mtlPath))
+        if (!IsNonEmptyFile(path))
             return false;
 
         try
         {
-            var hasVertex = false;
-            var hasFace = false;
-
-            foreach (var line in File.ReadLines(objPath))
-            {
-                if (line.StartsWith("v ", StringComparison.Ordinal))
-                    hasVertex = true;
-                else if (line.StartsWith("f ", StringComparison.Ordinal))
-                    hasFace = true;
-            }
-
-            if (!hasVertex || !hasFace)
+            var data = File.ReadAllBytes(path);
+            if (data.Length < 28 ||
+                data[0] != (byte)'g' ||
+                data[1] != (byte)'l' ||
+                data[2] != (byte)'T' ||
+                data[3] != (byte)'F')
+                return false;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4, 4)) != 2)
+                return false;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(8, 4)) != (uint)data.Length)
                 return false;
 
-            foreach (var line in File.ReadLines(mtlPath))
-            {
-                var fields = line.Trim().Split(
-                    (char[]?)null,
-                    StringSplitOptions.RemoveEmptyEntries);
+            var jsonLength = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(12, 4));
+            var jsonType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(16, 4));
+            if (jsonType != 0x4E4F534A ||
+                jsonLength == 0 ||
+                jsonLength > (uint)(data.Length - 28))
+                return false;
 
-                if (fields.Length > 1 && fields[0].Equals("newmtl", StringComparison.OrdinalIgnoreCase))
-                    return true;
+            using var document = JsonDocument.Parse(data.AsMemory(20, checked((int)jsonLength)));
+
+            var root = document.RootElement;
+            if (!root.TryGetProperty("meshes", out var meshes) ||
+                meshes.ValueKind != JsonValueKind.Array ||
+                !meshes.EnumerateArray().Any(mesh =>
+                    mesh.ValueKind == JsonValueKind.Object &&
+                    mesh.TryGetProperty("primitives", out var primitives) &&
+                    primitives.ValueKind == JsonValueKind.Array &&
+                    primitives.GetArrayLength() > 0))
+                return false;
+
+            var binHeaderOffset = checked(20 + (int)jsonLength);
+            if (binHeaderOffset + 8 > data.Length)
+                return false;
+
+            var binLength = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(binHeaderOffset, 4));
+            var binType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(binHeaderOffset + 4, 4));
+            if (binType != 0x004E4942 ||
+                binLength == 0 ||
+                binLength > (uint)(data.Length - binHeaderOffset - 8))
+                return false;
+            if (root.TryGetProperty("images", out var images))
+            {
+                if (images.ValueKind != JsonValueKind.Array)
+                    return false;
+
+                foreach (var image in images.EnumerateArray())
+                {
+                    var hasBufferView =
+                        image.ValueKind == JsonValueKind.Object &&
+                        image.TryGetProperty("bufferView", out var bufferView) &&
+                        bufferView.ValueKind == JsonValueKind.Number;
+                    var hasDataUri =
+                        image.ValueKind == JsonValueKind.Object &&
+                        image.TryGetProperty("uri", out var imageUri) &&
+                        imageUri.ValueKind == JsonValueKind.String &&
+                        imageUri.GetString()!.StartsWith(
+                            "data:",
+                            StringComparison.OrdinalIgnoreCase);
+
+                    if (!hasBufferView && !hasDataUri)
+                        return false;
+                }
             }
+            if (root.TryGetProperty("buffers", out var buffers))
+            {
+                if (buffers.ValueKind != JsonValueKind.Array)
+                    return false;
+                foreach (var buffer in buffers.EnumerateArray())
+                {
+                    if (buffer.ValueKind != JsonValueKind.Object || !buffer.TryGetProperty("uri", out var uri))
+                        continue;
+                    if (uri.ValueKind == JsonValueKind.String &&
+                        !uri.GetString()!.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
+            }
+
+            return true;
         }
-        catch (IOException)
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or
+            JsonException or ArgumentException or OverflowException)
         {
             return false;
         }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-
-        return false;
-    }
-
-    private static string? ResolveMtlTexturePath(string mtlPath, string line)
-    {
-        var fields = line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-        if (fields.Length < 2 ||
-            !fields[0].StartsWith("map_", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        var index = 1;
-
-        while (index < fields.Length && fields[index].StartsWith("-", StringComparison.Ordinal))
-            switch (fields[index])
-            {
-                case "-o":
-                case "-s":
-                    index += 4;
-                    break;
-
-                case "-bm":
-                case "-boost":
-                case "-texres":
-                case "-clamp":
-                case "-blendu":
-                case "-blendv":
-                case "-imfchan":
-                case "-type":
-                    index += 2;
-                    break;
-
-                default:
-                    return null;
-            }
-        if (index >= fields.Length)
-            return null;
-
-        var reference = string.Join(" ", fields.Skip(index)).Trim().Trim('"');
-        if (string.IsNullOrWhiteSpace(reference))
-            return null;
-
-        reference = reference.Replace('/', Path.DirectorySeparatorChar);
-
-        return Path.IsPathRooted(reference)
-            ? Path.GetFullPath(reference)
-            : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(mtlPath)!, reference));
     }
 }

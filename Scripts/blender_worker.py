@@ -7,6 +7,7 @@ import atexit
 import shutil
 import tempfile
 import gc
+import struct
 from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -246,150 +247,326 @@ def import_vtf(input_root, input_path, output_path):
             raise RuntimeError("The texture exporter did not produce a valid PNG file.")
 
 
-def validate_obj_geometry(output_path):
-    has_vertices = False
-    has_faces = False
 
-    with open(output_path, "r", encoding="utf-8", errors="replace") as file:
-        for line in file:
-            parts = line.strip().split()
-            if not parts:
-                continue
-            if parts[0] == "v" and len(parts) >= 4:
-                has_vertices = True
-            elif parts[0] == "f" and len(parts) >= 4:
-                has_faces = True
-            if has_vertices and has_faces:
-                return
+def ensure_gltf_exporter_registered():
+    """Ensure Blender's bundled glTF exporter is available."""
+    try:
+        bpy.ops.export_scene.gltf.get_rna_type()
+        return
+    except Exception:
+        pass
 
-    raise RuntimeError("Model import/export produced no usable mesh geometry (OBJ must contain vertices and faces).")
+    import addon_utils
 
+    errors = []
+    for module_name in (
+        "io_scene_gltf2",
+        "bl_ext.blender_org.io_scene_gltf2",
+    ):
+        try:
+            addon_utils.enable(
+                module_name,
+                default_set=False,
+                persistent=False,
+            )
+            bpy.ops.export_scene.gltf.get_rna_type()
+            return
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
 
-def ensure_obj_material_library(output_path):
-    """Ensure the OBJ references a corresponding non-empty MTL with every used material."""
-    mtl_path = os.path.splitext(output_path)[0] + ".mtl"
-    mtl_name = os.path.basename(mtl_path)
-
-    with open(output_path, "r", encoding="utf-8", errors="replace") as file:
-        lines = file.read().splitlines()
-
-    used_materials = []
-    for line in lines:
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0] == "usemtl" and parts[1] not in used_materials:
-            used_materials.append(parts[1])
-
-    if not used_materials:
-        first_face = next(
-            (index for index, line in enumerate(lines)
-             if line.strip().split()[:1] == ["f"]),
-            None,
-        )
-        if first_face is None:
-            raise RuntimeError("OBJ contains no faces; refusing to save an empty model export.")
-        used_materials = [DEFAULT_MATERIAL]
-        lines.insert(first_face, "usemtl " + DEFAULT_MATERIAL)
-
-    present_materials = set()
-    if os.path.isfile(mtl_path) and os.path.getsize(mtl_path) > 0:
-        with open(mtl_path, "r", encoding="utf-8", errors="replace") as file:
-            for line in file:
-                parts = line.strip().split(None, 1)
-                if len(parts) == 2 and parts[0] == "newmtl":
-                    present_materials.add(parts[1])
-
-    missing_materials = [name for name in used_materials if name not in present_materials]
-    if missing_materials:
-        with open(mtl_path, "a", encoding="utf-8", newline="\n") as file:
-            if os.path.getsize(mtl_path) > 0:
-                file.write("\n")
-            for name in missing_materials:
-                file.write(
-                    f"newmtl {name}\n"
-                    "Ns 20.000000\n"
-                    "Ka 0.800000 0.800000 0.800000\n"
-                    "Kd 0.800000 0.800000 0.800000\n"
-                    "Ks 0.000000 0.000000 0.000000\n"
-                    "d 1.000000\n"
-                    "illum 2\n\n"
-                )
-
-    lines = [line for line in lines if not line.strip().startswith("mtllib ")]
-    lines.insert(0, "mtllib " + mtl_name)
-    with open(output_path, "w", encoding="utf-8", newline="\n") as file:
-        file.write("\n".join(lines) + "\n")
-
-    if not os.path.isfile(mtl_path) or os.path.getsize(mtl_path) == 0:
-        raise RuntimeError("OBJ export did not produce a non-empty MTL file.")
+    raise RuntimeError(
+        "Blender's glTF 2.0 exporter is unavailable: "
+        + " | ".join(errors)
+    )
 
 
-def get_mtl_texture_path(line):
-    """Extract a texture filename from an MTL map directive."""
-    fields = line.strip().split()
-    if len(fields) < 2:
-        return None
+def _iter_material_image_nodes(node_tree, visited=None):
+    """Find image nodes in a material tree, including nested node groups."""
+    if node_tree is None:
+        return
 
-    index = 1
-    while index < len(fields) and fields[index].startswith("-"):
-        option = fields[index]
+    if visited is None:
+        visited = set()
 
-        if option in ("-o", "-s"):
-            index += 4
-        elif option in (
-            "-bm", "-boost", "-texres", "-clamp",
-            "-blendu", "-blendv", "-imfchan", "-type",
+    tree_id = node_tree.as_pointer()
+    if tree_id in visited:
+        return
+    visited.add(tree_id)
+
+    for node in node_tree.nodes:
+        if node.type == "TEX_IMAGE" and node.image is not None:
+            yield node, node.image
+        elif node.type == "GROUP" and node.node_tree is not None:
+            yield from _iter_material_image_nodes(
+                node.node_tree, visited
+            )
+
+
+def _choose_material_image(entries, include, exclude=()):
+    for node, image, label in entries:
+        name = label.casefold()
+        if (
+            any(token in name for token in include)
+            and not any(token in name for token in exclude)
         ):
-            index += 2
-        else:
-            return None
-
-    if index >= len(fields):
-        return None
-
-    return " ".join(fields[index:]).strip().strip('"')
+            return image
+    return None
 
 
-def validate_obj_textures(output_path):
-    """Verify diffuse textures, but don't reject usable model geometry if missing."""
-    mtl_path = os.path.splitext(output_path)[0] + ".mtl"
+def prepare_materials_for_gltf(mesh_objects):
+    """
+    Convert SourceIO materials to glTF-compatible Principled BSDF materials.
+    Preserve recognizable base-color, normal, roughness, metallic and
+    emissive images when SourceIO's material graph exposes them.
+    """
+    materials = {
+        slot.material
+        for obj in mesh_objects
+        for slot in obj.material_slots
+        if slot.material is not None
+    }
 
-    if not os.path.isfile(mtl_path) or os.path.getsize(mtl_path) == 0:
-        raise RuntimeError("Model export has no non-empty MTL material library.")
+    for material in materials:
+        material.use_nodes = True
+        entries = []
+        packed_ids = set()
 
-    with open(mtl_path, "r", encoding="utf-8", errors="replace") as file:
-        for line in file:
-            fields = line.strip().split(None, 1)
-            if not fields or fields[0].casefold() != "map_kd":
-                continue
+        for node, image in _iter_material_image_nodes(
+            material.node_tree
+        ):
+            label = " ".join(
+                str(value or "")
+                for value in (node.name, node.label, image.name)
+            )
+            entries.append((node, image, label))
 
-            texture_reference = get_mtl_texture_path(line)
-            if not texture_reference:
-                continue
-
-            if not os.path.isabs(texture_reference):
-                texture_reference = os.path.join(
-                    os.path.dirname(mtl_path),
-                    texture_reference,
-                )
-
-            texture_path = os.path.abspath(texture_reference)
-            if not os.path.isfile(texture_path) or os.path.getsize(texture_path) == 0:
-                continue
-
-            with open(texture_path, "rb") as image_file:
-                if image_file.read(len(PNG_SIGNATURE)) == PNG_SIGNATURE:
+            image_id = image.as_pointer()
+            if image_id not in packed_ids:
+                packed_ids.add(image_id)
+                try:
+                    if image.has_data and image.packed_file is None:
+                        image.pack()
+                except Exception as exc:
                     print(
-                        f"[model] Verified diffuse texture: {texture_path}",
+                        f"[model] Warning: could not pack "
+                        f"{image.name!r}: {exc}",
                         flush=True,
                     )
-                    return True
+
+        excluded = (
+            "normal", "bump", "rough", "metal", "spec",
+            "emissive", "emission", "alpha", "mask",
+            "envmap", "environment",
+        )
+        base_image = _choose_material_image(
+            entries,
+            (
+                "basetexture", "base_texture", "base color",
+                "basecolor", "diffuse", "albedo", "color", "colour",
+            ),
+            excluded,
+        )
+        if base_image is None:
+            base_image = next(
+                (
+                    image for _, image, label in entries
+                    if not any(token in label.casefold() for token in excluded)
+                ),
+                entries[0][1] if entries else None,
+            )
+
+        normal_image = _choose_material_image(
+            entries, ("normal", "normalmap", "normal_map", "bump")
+        )
+        roughness_image = _choose_material_image(
+            entries, ("roughness", "rough")
+        )
+        metallic_image = _choose_material_image(
+            entries, ("metallic", "metalness")
+        )
+        emissive_image = _choose_material_image(
+            entries, ("emissive", "emission", "selfillum")
+        )
+
+        tree = material.node_tree
+        tree.nodes.clear()
+
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        output.location = (500, 0)
+
+        principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
+        principled.location = (200, 0)
+        tree.links.new(
+            principled.outputs["BSDF"],
+            output.inputs["Surface"],
+        )
+
+        def connect_image(image, socket_name, y, non_color=False):
+            if image is None:
+                return None
+
+            if non_color:
+                try:
+                    image.colorspace_settings.name = "Non-Color"
+                except Exception:
+                    pass
+
+            texture = tree.nodes.new("ShaderNodeTexImage")
+            texture.image = image
+            texture.label = image.name
+            texture.location = (-500, y)
+
+            socket = principled.inputs.get(socket_name)
+            if socket is not None:
+                tree.links.new(texture.outputs["Color"], socket)
+
+            return texture
+
+        connect_image(base_image, "Base Color", 200)
+        connect_image(roughness_image, "Roughness", -100, True)
+        connect_image(metallic_image, "Metallic", -300, True)
+
+        if normal_image is not None:
+            normal_texture = connect_image(
+                normal_image, "__unused__", -500, True
+            )
+            if normal_texture is not None:
+                normal_map = tree.nodes.new("ShaderNodeNormalMap")
+                normal_map.location = (-120, -500)
+                tree.links.new(
+                    normal_texture.outputs["Color"],
+                    normal_map.inputs["Color"],
+                )
+                normal_socket = principled.inputs.get("Normal")
+                if normal_socket is not None:
+                    tree.links.new(
+                        normal_map.outputs["Normal"],
+                        normal_socket,
+                    )
+
+        if emissive_image is not None:
+            emission_socket = (
+                "Emission Color"
+                if principled.inputs.get("Emission Color")
+                else "Emission"
+            )
+            connect_image(emissive_image, emission_socket, -700)
+
+        alpha_socket = principled.inputs.get("Alpha")
+        if alpha_socket is not None and base_image is not None:
+            alpha_texture = next(
+                (
+                    node for node in tree.nodes
+                    if node.type == "TEX_IMAGE"
+                    and node.image == base_image
+                ),
+                None,
+            )
+            if (
+                alpha_texture is not None
+                and alpha_texture.outputs.get("Alpha") is not None
+            ):
+                tree.links.new(
+                    alpha_texture.outputs["Alpha"],
+                    alpha_socket,
+                )
+
+    # Pack loaded images so GLB does not need adjacent image files.
+    for image in bpy.data.images:
+        try:
+            if image.has_data and image.packed_file is None:
+                image.pack()
+        except Exception as exc:
+            print(
+                f"[model] Warning: could not pack "
+                f"{image.name!r}: {exc}",
+                flush=True,
+            )
+
+
+def validate_glb_model(output_path):
+    """Validate GLB 2.0 structure, geometry, and embedded image references."""
+    with open(output_path, "rb") as file:
+        data = file.read()
+
+    if len(data) < 28:
+        raise RuntimeError("GLB is too short to be valid.")
+
+    magic, version, declared_length = struct.unpack_from(
+        "<4sII", data, 0
+    )
+    if magic != b"glTF" or version != 2:
+        raise RuntimeError("Output is not a GLB 2.0 file.")
+    if declared_length != len(data):
+        raise RuntimeError("GLB declared length does not match its file size.")
+
+    json_length, json_type = struct.unpack_from("<II", data, 12)
+    if json_type != 0x4E4F534A:
+        raise RuntimeError("GLB JSON chunk is missing.")
+    json_end = 20 + json_length
+
+    if json_length == 0 or json_end + 8 > len(data):
+        raise RuntimeError("GLB JSON chunk has an invalid length.")
+
+    try:
+        document = json.loads(
+            data[20:json_end].rstrip(b" \t\r\n\x00").decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid GLB JSON chunk: {exc}") from exc
+
+    meshes = document.get("meshes", [])
+    if not isinstance(meshes, list) or not any(
+        isinstance(mesh, dict)
+        and isinstance(mesh.get("primitives"), list)
+        and mesh["primitives"]
+        for mesh in meshes
+    ):
+        raise RuntimeError("GLB contains no mesh primitives.")
+
+    binary_length, binary_type = struct.unpack_from(
+        "<II", data, json_end
+    )
+    binary_start = json_end + 8
+
+    if binary_type != 0x004E4942:
+        raise RuntimeError("GLB binary chunk is missing.")
+    if (
+        binary_length == 0
+        or binary_start + binary_length > len(data)
+    ):
+        raise RuntimeError("GLB binary chunk has an invalid length.")
+
+    for image in document.get("images", []):
+        uri = image.get("uri")
+        embedded = (
+            isinstance(image.get("bufferView"), int)
+            or (
+                isinstance(uri, str)
+                and uri.casefold().startswith("data:")
+            )
+        )
+        if not embedded:
+            raise RuntimeError(
+                "GLB references an external image instead of embedding it."
+            )
+
+    for buffer in document.get("buffers", []):
+        uri = buffer.get("uri")
+        if (
+            isinstance(uri, str)
+            and not uri.casefold().startswith("data:")
+        ):
+            raise RuntimeError(
+                "GLB references an external buffer file."
+            )
 
     print(
-        f"[model] WARNING: {output_path} has usable geometry and an MTL, "
-        "but no resolvable diffuse PNG. Keeping the OBJ and MTL.",
+        f"[model] GLB validated: meshes={len(meshes)}, "
+        f"materials={len(document.get('materials', []))}, "
+        f"embedded_images={len(document.get('images', []))}",
         flush=True,
     )
-    return False
 
 
 def resolve_dependency_file(game_root, relative_path, model_version):
@@ -1068,29 +1245,59 @@ def import_model(input_root, input_path, output_path, output_root):
     if fallback is None:
         fallback = bpy.data.materials.new(DEFAULT_MATERIAL)
 
-    bpy.ops.object.select_all(action="DESELECT")
-
     for obj in mesh_objects:
-        obj.select_set(True)
-
         if len(obj.data.materials) == 0:
             obj.data.materials.append(fallback)
 
+    prepare_materials_for_gltf(mesh_objects)
+    ensure_gltf_exporter_registered()
+
+    export_objects = list(mesh_objects)
+
+    for obj in mesh_objects:
+        parent = obj.parent
+        while parent is not None:
+            if (
+                parent.type == "ARMATURE"
+                and parent not in export_objects
+            ):
+                export_objects.append(parent)
+            parent = parent.parent
+
+        for modifier in obj.modifiers:
+            if (
+                modifier.type == "ARMATURE"
+                and modifier.object is not None
+                and modifier.object not in export_objects
+            ):
+                export_objects.append(modifier.object)
+
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in export_objects:
+        obj.select_set(True)
+
     bpy.context.view_layer.objects.active = mesh_objects[0]
 
-    bpy.ops.wm.obj_export(
+    export_result = bpy.ops.export_scene.gltf(
         filepath=output_path,
-        export_selected_objects=True,
-        export_materials=True,
-        path_mode="RELATIVE",
+        check_existing=False,
+        export_format="GLB",
+        export_image_format="AUTO",
+        export_materials="EXPORT",
+        export_animations=False,
+        export_cameras=False,
+        export_lights=False,
+        export_yup=True,
+        export_apply=False,
+        export_skins=True,
+        export_morph=True,
+        use_selection=True,
     )
 
-    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("Blender did not produce an OBJ file.")
+    if "CANCELLED" in export_result:
+        raise RuntimeError("Blender's glTF exporter cancelled the model export.")
 
-    validate_obj_geometry(output_path)
-    ensure_obj_material_library(output_path)
-    validate_obj_textures(output_path)
+    validate_glb_model(output_path)
 
 
 def node_tree_has_image_texture(node_tree, visited=None):
@@ -1248,31 +1455,39 @@ def import_bsp(input_root, input_path, output_path, output_root):
             )
 
 
+
 def validate_output(asset_type, output_path):
     if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("Converter returned without creating a non-empty output file.")
+        raise RuntimeError(
+            "Converter returned without creating a non-empty output file."
+        )
 
     extension = os.path.splitext(output_path)[1].casefold()
+
     if extension == ".blend" and asset_type != "map":
-        raise RuntimeError("Safety check rejected a .blend output not originating from a BSP job.")
+        raise RuntimeError(
+            "A .blend output is only allowed for BSP map jobs."
+        )
     if asset_type == "map" and extension != ".blend":
         raise RuntimeError("A BSP job must produce a .blend file.")
     if asset_type == "texture" and extension != ".png":
         raise RuntimeError("A texture job must produce a .png file.")
-    if asset_type == "model" and extension != ".obj":
-        raise RuntimeError("A model job must produce an .obj file.")
+    if asset_type == "model":
+        if extension != ".glb":
+            raise RuntimeError("A model job must produce a .glb file.")
+        validate_glb_model(output_path)
 
 
 def remove_failed_outputs(asset_type, output_path):
-    paths = [output_path]
-    if asset_type == "model":
-        paths.append(os.path.splitext(output_path)[0] + ".mtl")
-    for path in paths:
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-        except OSError as exc:
-            print(f"Warning: could not remove failed output {path}: {exc}", flush=True)
+    try:
+        if os.path.isfile(output_path):
+            os.remove(output_path)
+    except OSError as exc:
+        print(
+            f"Warning: could not remove failed output "
+            f"{output_path}: {exc}",
+            flush=True,
+        )
 
 
 def ensure_sourceio_registered():
@@ -1545,11 +1760,6 @@ def main():
 
             validate_output(asset_type, output_path)
             output_paths = [output_path]
-            if asset_type == "model":
-                mtl_path = os.path.splitext(output_path)[0] + ".mtl"
-                if not os.path.isfile(mtl_path) or os.path.getsize(mtl_path) == 0:
-                    raise RuntimeError("Model conversion did not produce its required MTL file.")
-                output_paths.append(mtl_path)
 
             results.append({
                 "InputPath": input_path,
