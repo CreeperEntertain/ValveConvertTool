@@ -759,7 +759,7 @@ def _select_compatible_model_dependencies(
     model_version,
 ):
     """Select the preferred eligible VVD/VTX pair that passes index checks."""
-        mdl_format_version, mdl = _load_mdl_for_pair_check(
+    mdl_format_version, mdl = _load_mdl_for_pair_check(
         physical_model_path
     )
 
