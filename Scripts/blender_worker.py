@@ -6,6 +6,10 @@ import traceback
 import atexit
 from pathlib import PurePosixPath
 
+_WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
+if _WORKER_DIR not in sys.path:
+    sys.path.insert(0, _WORKER_DIR)
+
 from versioned_content import DEFAULT_VERSIONED_CONTENT_VIEWS
 
 atexit.register(DEFAULT_VERSIONED_CONTENT_VIEWS.cleanup)
