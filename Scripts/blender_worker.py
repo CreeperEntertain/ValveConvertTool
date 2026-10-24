@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import gc
 import struct
+import math
 from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -1338,6 +1339,117 @@ def load_source1_animation_data(mdl, mdl_buffer, content_manager, model_path):
     return animations, descriptor_count
 
 
+def _finite_number(value, fallback=0.0):
+    """Replace NaN and infinity with a finite fallback value."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+    return value if math.isfinite(value) else fallback
+
+
+def sanitize_scene_for_gltf(mesh_objects, export_objects):
+    """Remove non-finite numeric values from data exported to glTF."""
+    for obj in export_objects:
+        for prop, defaults in (
+            ("location", (0.0, 0.0, 0.0)),
+            ("scale", (1.0, 1.0, 1.0)),
+        ):
+            values = tuple(getattr(obj, prop))
+            sanitized = tuple(
+                _finite_number(value, defaults[i])
+                for i, value in enumerate(values)
+            )
+            if values != sanitized:
+                setattr(obj, prop, sanitized)
+
+        if obj.rotation_mode == "QUATERNION":
+            values = tuple(obj.rotation_quaternion)
+            defaults = (1.0, 0.0, 0.0, 0.0)
+            sanitized = tuple(
+                _finite_number(value, defaults[i])
+                for i, value in enumerate(values)
+            )
+            if values != sanitized:
+                obj.rotation_quaternion = sanitized
+        elif obj.rotation_mode != "AXIS_ANGLE":
+            values = tuple(obj.rotation_euler)
+            sanitized = tuple(_finite_number(value) for value in values)
+            if values != sanitized:
+                obj.rotation_euler = sanitized
+
+    for obj in mesh_objects:
+        mesh = obj.data
+
+        for vertex in mesh.vertices:
+            values = tuple(vertex.co)
+            sanitized = tuple(_finite_number(value) for value in values)
+            if values != sanitized:
+                vertex.co = sanitized
+
+        shape_keys = mesh.shape_keys
+        if shape_keys is not None:
+            for key_block in shape_keys.key_blocks:
+                for point in key_block.data:
+                    values = tuple(point.co)
+                    sanitized = tuple(
+                        _finite_number(value) for value in values
+                    )
+                    if values != sanitized:
+                        point.co = sanitized
+
+        for attribute in mesh.attributes:
+            for item in attribute.data:
+                for prop in ("value", "vector", "color"):
+                    try:
+                        value = getattr(item, prop)
+                        if isinstance(value, (int, float)):
+                            sanitized = _finite_number(value)
+                            if sanitized != value:
+                                setattr(item, prop, sanitized)
+                        else:
+                            values = tuple(value)
+                            sanitized = tuple(
+                                _finite_number(component)
+                                for component in values
+                            )
+                            if values != sanitized:
+                                setattr(item, prop, sanitized)
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+
+    materials = {
+        slot.material
+        for obj in mesh_objects
+        for slot in obj.material_slots
+        if slot.material is not None
+    }
+
+    for material in materials:
+        if not material.use_nodes or material.node_tree is None:
+            continue
+
+        for node in material.node_tree.nodes:
+            for socket in node.inputs:
+                try:
+                    value = socket.default_value
+                    if isinstance(value, (int, float)):
+                        sanitized = _finite_number(value)
+                        if sanitized != value:
+                            socket.default_value = sanitized
+                    else:
+                        values = tuple(value)
+                        sanitized = tuple(
+                            _finite_number(component)
+                            for component in values
+                        )
+                        if values != sanitized:
+                            socket.default_value = sanitized
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+
 def create_source1_animation_actions(armature_objects, animation_sources, scale=1.0):
     """Build Blender 5-compatible slotted Actions from decoded SourceIO data."""
     from math import radians
@@ -1415,12 +1527,24 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
             positions = [[0.0] * count for _ in range(3)]
             rotations = [[0.0] * count for _ in range(4)]
             last_quaternion = None
+            last_location = None
 
             for frame_index in range(count):
                 frame_data = frames[frame_index]
-                position = Vector(frame_data["pos"]) * scale
-                x, y, z, w = frame_data["rot"]
+                position = Vector(
+                    tuple(_finite_number(v) for v in frame_data["pos"])
+                ) * scale
+
+                x, y, z, w = (
+                    _finite_number(v, 0.0)
+                    for v in frame_data["rot"]
+                )
                 quaternion = Quaternion((w, x, y, z))
+
+                if quaternion.length_squared < 1e-12:
+                    quaternion = Quaternion()
+                else:
+                    quaternion.normalize()
 
                 if getattr(animation, "is_delta", False):
                     if parent is None:
@@ -1441,6 +1565,20 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                     basis = rest_inverse @ armature_space
                     location, quaternion, _ = basis.decompose()
 
+                if not all(math.isfinite(float(v)) for v in location):
+                    location = (
+                        last_location.copy()
+                        if last_location is not None
+                        else Vector((0.0, 0.0, 0.0))
+                    )
+
+                if not all(math.isfinite(float(v)) for v in quaternion):
+                    quaternion = (
+                        last_quaternion.copy()
+                        if last_quaternion is not None
+                        else Quaternion()
+                    )
+
                 if (
                     last_quaternion is not None
                     and quaternion.dot(last_quaternion) < 0.0
@@ -1448,6 +1586,7 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                     quaternion = -quaternion
 
                 last_quaternion = quaternion.copy()
+                last_location = location.copy()
 
                 for axis in range(3):
                     positions[axis][frame_index] = float(location[axis])
@@ -1795,6 +1934,7 @@ def import_model(input_root, input_path, output_path, output_root):
         imported_actions,
     )
 
+    sanitize_scene_for_gltf(mesh_objects, export_objects)
     bpy.ops.object.select_all(action="DESELECT")
     for obj in export_objects:
         obj.select_set(True)
@@ -1811,7 +1951,7 @@ def import_model(input_root, input_path, output_path, output_root):
         export_animation_mode="NLA_TRACKS",
         export_frame_range=False,
         export_frame_step=1,
-        export_force_sampling=True,
+        export_force_sampling=False,
         export_cameras=False,
         export_lights=False,
         export_yup=True,
