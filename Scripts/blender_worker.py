@@ -9,9 +9,12 @@ import tempfile
 import gc
 import struct
 import math
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PurePosixPath
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 _WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 if _WORKER_DIR not in sys.path:
