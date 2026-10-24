@@ -417,7 +417,7 @@ def _material_channel_has_linked_input(material, channel):
         return False
 
     for node in _walk_material_nodes(tree):
-        socket, _fallback = _channel_input_for_shader(node, channel)
+        socket = _channel_input_for_shader(node, channel)
         if socket is not None and socket.is_linked:
             return True
 
