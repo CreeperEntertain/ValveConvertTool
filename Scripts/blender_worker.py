@@ -1349,6 +1349,113 @@ def _finite_number(value, fallback=0.0):
     return value if math.isfinite(value) else fallback
 
 
+def install_gltf_json_finite_guard():
+    """Prevent Blender's glTF JSON serializer from crashing on NaN/Inf."""
+    import importlib
+
+    gltf_export = None
+
+    for module_name in (
+        "io_scene_gltf2.blender.exp.export",
+        "bl_ext.blender_org.io_scene_gltf2.blender.exp.export",
+    ):
+        try:
+            gltf_export = importlib.import_module(module_name)
+            break
+        except ImportError:
+            continue
+
+    if gltf_export is None:
+        raise RuntimeError(
+            "Could not locate Blender's glTF exporter module."
+        )
+
+    original_fix_json = gltf_export.__fix_json
+
+    if getattr(original_fix_json, "_valveconvert_finite_guard", False):
+        return
+
+    state = {"inside": False}
+
+    def sanitize_json(value, path="$", key=None, bad=None):
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return value
+
+            bad[0] += 1
+            if len(bad[1]) < 8:
+                bad[1].append(path)
+
+            return 1.0 if key == "scale" else 0.0
+
+        if isinstance(value, dict):
+            result = {}
+
+            for child_key, child_value in value.items():
+                child_path = f"{path}.{child_key}"
+
+                if (
+                    child_key == "rotation"
+                    and isinstance(child_value, (list, tuple))
+                    and any(
+                        isinstance(component, float)
+                        and not math.isfinite(component)
+                        for component in child_value
+                    )
+                ):
+                    bad[0] += 1
+                    if len(bad[1]) < 8:
+                        bad[1].append(child_path)
+
+                    result[child_key] = [0.0, 0.0, 0.0, 1.0]
+                else:
+                    result[child_key] = sanitize_json(
+                        child_value,
+                        child_path,
+                        child_key,
+                        bad,
+                    )
+
+            return result
+
+        if isinstance(value, (list, tuple)):
+            return [
+                sanitize_json(
+                    item,
+                    f"{path}[{index}]",
+                    key,
+                    bad,
+                )
+                for index, item in enumerate(value)
+            ]
+
+        return value
+
+    def finite_fix_json(obj, export_settings):
+        if state["inside"]:
+            return original_fix_json(obj, export_settings)
+
+        state["inside"] = True
+        bad = [0, []]
+
+        try:
+            cleaned = sanitize_json(obj, bad=bad)
+
+            if bad[0]:
+                print(
+                    f"[gltf] Replaced {bad[0]} non-finite JSON value(s). "
+                    f"First affected paths: {', '.join(bad[1])}",
+                    flush=True,
+                )
+
+            return original_fix_json(cleaned, export_settings)
+        finally:
+            state["inside"] = False
+
+    finite_fix_json._valveconvert_finite_guard = True
+    gltf_export.__fix_json = finite_fix_json
+
+
 def sanitize_scene_for_gltf(mesh_objects, export_objects):
     """Remove non-finite numeric values from data exported to glTF."""
     for obj in export_objects:
@@ -1886,6 +1993,7 @@ def import_model(input_root, input_path, output_path, output_root):
 
     prepare_materials_for_gltf(mesh_objects)
     ensure_gltf_exporter_registered()
+    install_gltf_json_finite_guard()
 
     export_objects = list(mesh_objects)
 
