@@ -1403,6 +1403,7 @@ def prepare_materials_for_gltf(mesh_objects):
             principled = tree.nodes.new(
                 "ShaderNodeBsdfPrincipled"
             )
+            principled.inputs["Roughness"].default_value = 1.0
             principled.location = (200, 0)
 
             tree.links.new(
