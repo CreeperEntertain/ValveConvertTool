@@ -2221,10 +2221,10 @@ def _select_compatible_model_dependencies(
                 total_indices = recovery_info["total_render_indices"]
 
                 structural_loss = max(
-                    info["missing_mdl_models"]
-                    / max(info["total_mdl_models"], 1),
-                    info["missing_mdl_body_parts"]
-                    / max(info["total_mdl_body_parts"], 1),
+                    recovery_info["missing_mdl_models"]
+                    / max(recovery_info["total_mdl_models"], 1),
+                    recovery_info["missing_mdl_body_parts"]
+                    / max(recovery_info["total_mdl_body_parts"], 1),
                 )
 
                 triangle_loss = (
