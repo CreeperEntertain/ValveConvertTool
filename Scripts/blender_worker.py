@@ -3101,28 +3101,32 @@ def import_model(input_root, input_path, output_path, output_root):
         and armature_objects
         and not animation_sources
     ):
-        raise RuntimeError(
-            f"SourceIO found {animation_descriptor_count} non-empty "
-            "animation descriptor(s), but its data parser decoded no "
-            "animation clips. Refusing to export a silently static GLB."
+        print(
+            f"[model] WARNING: Found {animation_descriptor_count} "
+            "animation descriptor(s), but none could be decoded. "
+            "Exporting the model without animation.",
+            flush=True,
+        )
+        imported_actions = []
+    else:
+        imported_actions = create_source1_animation_actions(
+            armature_objects,
+            animation_sources,
+            scale=SOURCE1_HAMMER_UNIT_TO_METERS,
         )
 
-    imported_actions = create_source1_animation_actions(
-        armature_objects,
-        animation_sources,
-        scale=SOURCE1_HAMMER_UNIT_TO_METERS,
-    )
-
-    if (
-        animation_descriptor_count > 0
-        and armature_objects
-        and not imported_actions
-    ):
-        raise RuntimeError(
-            "Animation data was decoded, but no clips could be bound "
-            "to the imported armature. Refusing to export a silently "
-            "static GLB."
-        )
+        if (
+            animation_descriptor_count > 0
+            and armature_objects
+            and animation_sources
+            and not imported_actions
+        ):
+            print(
+                "[model] WARNING: Animation data was decoded, but no "
+                "clips could be bound to the armature. "
+                "Exporting the model without animation.",
+                flush=True,
+            )
 
     expected_animation_count = prepare_animation_tracks_for_gltf(
         armature_objects,
