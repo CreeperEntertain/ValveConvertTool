@@ -1910,7 +1910,7 @@ def sourceio_vtx_index_recovery(enabled):
 
 
 def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
-    """Validate a pair and identify whether bad vertex indices are recoverable."""
+    """Validate a pair and identify recoverable structural/index mismatches."""
     from SourceIO.blender_bindings.models.common import merge_meshes
     from SourceIO.library.models.vtx import open_vtx
     from SourceIO.library.models.vvd import Vvd
@@ -1925,11 +1925,12 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
 
     all_vertices = vvd.lod_data[0]
 
-    if len(vtx.body_parts) != len(mdl.body_parts):
-        return False, (
-            f"VTX body-part count {len(vtx.body_parts)} does not match "
-            f"MDL count {len(mdl.body_parts)}"
-        ), None
+    total_mdl_models = sum(
+        1
+        for body_part in mdl.body_parts
+        for model in body_part.models
+        if model.vertex_count > 0
+    )
 
     info = {
         "invalid_vertex_references": 0,
@@ -1938,22 +1939,69 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
         "total_render_indices": 0,
         "invalid_triangles": 0,
         "total_triangles": 0,
+        "missing_mdl_body_parts": max(
+            len(mdl.body_parts) - len(vtx.body_parts), 0
+        ),
+        "extra_vtx_body_parts": max(
+            len(vtx.body_parts) - len(mdl.body_parts), 0
+        ),
+        "missing_mdl_models": 0,
+        "extra_vtx_models": 0,
+        "total_mdl_body_parts": len(mdl.body_parts),
+        "total_mdl_models": total_mdl_models,
     }
+
+    structural_reasons = []
     recovery_reasons = []
     checked_models = 0
+
+    if len(vtx.body_parts) != len(mdl.body_parts):
+        if len(vtx.body_parts) < len(mdl.body_parts):
+            for body_part in mdl.body_parts[len(vtx.body_parts):]:
+                info["missing_mdl_models"] += sum(
+                    1
+                    for model in body_part.models
+                    if model.vertex_count > 0
+                )
+
+            structural_reasons.append(
+                f"VTX has {len(vtx.body_parts)} body part(s), but MDL "
+                f"has {len(mdl.body_parts)}; unmatched MDL body parts "
+                "will be omitted"
+            )
+        else:
+            structural_reasons.append(
+                f"VTX has {len(vtx.body_parts)} body part(s), but MDL "
+                f"has {len(mdl.body_parts)}; extra VTX body parts "
+                "will be ignored"
+            )
 
     for vtx_body_part, body_part in zip(
         vtx.body_parts, mdl.body_parts
     ):
-        if len(vtx_body_part.models) != len(body_part.models):
-            return False, (
-                f"VTX model count does not match MDL body part "
-                f"{body_part.name!r}"
-            ), None
+        vtx_models = vtx_body_part.models
+        mdl_models = body_part.models
 
-        for vtx_model, model in zip(
-            vtx_body_part.models, body_part.models
-        ):
+        if len(vtx_models) != len(mdl_models):
+            if len(vtx_models) < len(mdl_models):
+                missing_models = mdl_models[len(vtx_models):]
+                info["missing_mdl_models"] += sum(
+                    1
+                    for model in missing_models
+                    if model.vertex_count > 0
+                )
+            else:
+                info["extra_vtx_models"] += (
+                    len(vtx_models) - len(mdl_models)
+                )
+
+            structural_reasons.append(
+                f"VTX has {len(vtx_models)} model slot(s), but MDL has "
+                f"{len(mdl_models)} for body part {body_part.name!r}; "
+                "unmatched entries will be omitted"
+            )
+
+        for vtx_model, model in zip(vtx_models, mdl_models):
             if model.vertex_count == 0:
                 continue
 
@@ -2008,7 +2056,10 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
                 triangle_valid = True
 
                 for render_index in indices[offset:offset + 3]:
-                    if render_index < 0 or render_index >= len(vtx_vertices):
+                    if (
+                        render_index < 0
+                        or render_index >= len(vtx_vertices)
+                    ):
                         triangle_valid = False
                         continue
 
@@ -2039,14 +2090,22 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
                     f"{invalid_indices} invalid render index value(s)"
                 )
 
-                if triangle_count == 0 or valid_triangle_count == 0:
+                if valid_triangle_count == 0:
                     return False, (
                         f"VTX/VVD mismatch for {model.name!r} leaves no "
                         "valid triangles to import"
                     ), None
 
-    if recovery_reasons:
-        return False, "; ".join(recovery_reasons), info
+    if structural_reasons or recovery_reasons:
+        if info["total_triangles"] == 0:
+            return False, (
+                "; ".join(structural_reasons + recovery_reasons)
+                + "; no usable triangle geometry exists in the "
+                "overlapping models"
+            ), None
+
+        reasons = structural_reasons + recovery_reasons
+        return False, "; ".join(reasons), info
 
     return True, f"checked {checked_models} model(s)", None
 
@@ -2161,11 +2220,26 @@ def _select_compatible_model_dependencies(
                 ]
                 total_indices = recovery_info["total_render_indices"]
 
+                structural_loss = max(
+                    info["missing_mdl_models"]
+                    / max(info["total_mdl_models"], 1),
+                    info["missing_mdl_body_parts"]
+                    / max(info["total_mdl_body_parts"], 1),
+                )
+
+                triangle_loss = (
+                    invalid_triangles / max(total_triangles, 1)
+                )
+
+                index_loss = (
+                    invalid_vertices + invalid_indices
+                ) / max(total_vertices + total_indices, 1)
+
                 score = (
-                    invalid_triangles / max(total_triangles, 1),
-                    (
-                        invalid_vertices + invalid_indices
-                    ) / max(total_vertices + total_indices, 1),
+                    structural_loss + triangle_loss,
+                    structural_loss,
+                    triangle_loss,
+                    index_loss,
                     invalid_triangles,
                     invalid_vertices,
                     invalid_indices,
@@ -2191,9 +2265,16 @@ def _select_compatible_model_dependencies(
         print(
             f"[model] WARNING: No fully compatible VVD/VTX pair exists "
             f"for {physical_model_path}. Using the least-damaged "
-            "recoverable pair. Invalid triangles: "
-            f"{info['invalid_triangles']} of "
-            f"{info['total_triangles']}. Details: {reason}",
+            "recoverable pair. "
+            f"Invalid triangles: {info['invalid_triangles']} of "
+            f"{info['total_triangles']}; "
+            f"omitted MDL body parts: "
+            f"{info['missing_mdl_body_parts']}; "
+            f"omitted MDL model slots: "
+            f"{info['missing_mdl_models']}; "
+            f"ignored extra VTX body parts: "
+            f"{info['extra_vtx_body_parts']}. "
+            f"Details: {reason}",
             flush=True,
         )
         return selected_vvd, selected_vtx, True
