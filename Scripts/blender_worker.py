@@ -3240,10 +3240,6 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
     if not armatures:
         return []
 
-    root_rotation = Euler(
-        (0.0, 0.0, radians(-90.0))
-    ).to_matrix().to_4x4()
-
     created_actions = []
 
     for animation_source in animation_sources:
