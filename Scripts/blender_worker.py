@@ -2934,6 +2934,7 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
 
 def import_model(input_root, input_path, output_path, output_root):
     from SourceIO.library.shared.content_manager import ContentManager
+    from SourceIO.library.utils.math_utilities import SOURCE1_HAMMER_UNIT_TO_METERS
 
     ensure_parent(output_path)
 
@@ -3109,7 +3110,7 @@ def import_model(input_root, input_path, output_path, output_root):
     imported_actions = create_source1_animation_actions(
         armature_objects,
         animation_sources,
-        scale=1.0,
+        scale=SOURCE1_HAMMER_UNIT_TO_METERS,
     )
 
     if (
