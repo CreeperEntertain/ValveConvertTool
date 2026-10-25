@@ -3172,12 +3172,17 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
             f"{PurePosixPath(model_path).stem}_{animation.name}"
         )
 
+        action = bpy.data.actions.new(name=action_name)
+        action.use_fake_user = True
+
         source_fps = _finite_number(
             getattr(animation, "fps", 30.0),
             30.0,
         )
         if source_fps <= 0.0:
             source_fps = 30.0
+
+        action["source_fps"] = source_fps
 
         scene = bpy.context.scene
         fps_base = _finite_number(scene.render.fps_base, 1.0)
@@ -3189,16 +3194,7 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
         )
         frame_scale = gltf_frame_rate / source_fps
 
-        factory = ActionCurveFactory(
-            armature.name,
-            armature,
-            legacy_behavior=True,
-        )
-        factory.new_action(action_name)
-
-        action = factory.action
-        action["source_fps"] = source_fps
-
+        factory = ActionCurveFactory(action, armature)
         curve_count = 0
 
         for bone_name, frames in bone_frames.items():
