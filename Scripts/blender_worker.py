@@ -1739,13 +1739,6 @@ def _install_sourceio_frame_animation_compatibility():
         StudioAnimDesc,
     )
 
-    if getattr(
-        StudioAnimDesc,
-        "_vct_frame_animation_compatibility",
-        False,
-    ):
-        return
-
     def read_frame_animations(self, buffer, bones, section_frame_count):
         try:
             frame_count = max(0, int(section_frame_count))
@@ -1887,6 +1880,85 @@ def _install_sourceio_frame_animation_compatibility():
 
     StudioAnimDesc._read_frame_animations = read_frame_animations
     StudioAnimDesc._vct_frame_animation_compatibility = True
+
+    original_read_animation_frames = (
+        StudioAnimDesc._read_animation_frames
+    )
+
+    if not getattr(
+        original_read_animation_frames,
+        "_vct_default_samples_installed",
+        False,
+    ):
+
+        def read_animation_frames_with_defaults(
+            self,
+            buffer,
+            bones,
+            section_frame_count,
+        ):
+            frame_count = max(0, int(section_frame_count))
+
+            if frame_count == 0:
+                return None
+
+            decoded = original_read_animation_frames(
+                self,
+                buffer,
+                bones,
+                frame_count,
+            )
+
+            is_delta = bool(self.flags & AnimDescFlags.DELTA)
+
+            has_sections = bool(
+                self.section_offset
+                and self.section_frame_count
+            )
+            if decoded is None and not has_sections:
+                return None
+
+            result = {}
+
+            for bone in bones:
+                samples = np.zeros(
+                    (frame_count,),
+                    dtype=ANIM_DTYPE,
+                )
+
+                if is_delta:
+                    samples["pos"] = (0.0, 0.0, 0.0)
+                    samples["rot"] = (0.0, 0.0, 0.0, 1.0)
+                else:
+                    samples["pos"] = tuple(
+                        float(v) for v in bone.position
+                    )
+                    samples["rot"] = tuple(
+                        float(v) for v in bone.quat
+                    )
+
+                if decoded:
+                    bone_samples = decoded.get(bone.name)
+
+                    if bone_samples is not None:
+                        copy_count = min(
+                            frame_count,
+                            len(bone_samples),
+                        )
+                        samples[:copy_count] = (
+                            bone_samples[:copy_count]
+                        )
+
+                result[bone.name] = samples
+
+            return result
+
+        read_animation_frames_with_defaults._vct_default_samples_installed = (
+            True
+        )
+        StudioAnimDesc._read_animation_frames = (
+            read_animation_frames_with_defaults
+        )
 
 
 def _load_mdl_for_pair_check(mdl_path):
@@ -2782,6 +2854,7 @@ def load_source1_animation_data(mdl, mdl_buffer, content_manager, model_path):
         load_animations_from_mdl,
     )
     from SourceIO.library.utils.tiny_path import TinyPath
+    from SourceIO.library.models.mdl.structs.local_animation import AnimDescFlags
 
     animations = []
     visited = set()
@@ -2830,6 +2903,12 @@ def load_source1_animation_data(mdl, mdl_buffer, content_manager, model_path):
         visited.add(key)
 
         descriptors = getattr(current_mdl, "anim_descs", ()) or ()
+        post_delta_by_name = {
+            str(descriptor.name).casefold(): bool(
+                descriptor.flags & AnimDescFlags.POST
+            )
+            for descriptor in descriptors
+        }
         descriptor_count += sum(
             1
             for descriptor in descriptors
@@ -2850,7 +2929,14 @@ def load_source1_animation_data(mdl, mdl_buffer, content_manager, model_path):
                     getattr(animation, "frame_count", 0) > 0
                     and getattr(animation, "frames", None)
                 ):
-                    animations.append((logical_path.as_posix(), animation))
+                    animations.append((
+                        logical_path.as_posix(),
+                        animation,
+                        post_delta_by_name.get(
+                            str(animation.name).casefold(),
+                            False,
+                        ),
+                    ))
 
         except Exception as exc:
             print(
@@ -3144,8 +3230,7 @@ def sanitize_scene_for_gltf(mesh_objects, export_objects):
 
 def create_source1_animation_actions(armature_objects, animation_sources, scale=1.0):
     """Build Blender 5-compatible slotted Actions from decoded SourceIO data."""
-    from math import radians
-    from mathutils import Euler, Matrix, Quaternion, Vector
+    from mathutils import Matrix, Quaternion, Vector
     from SourceIO.blender_bindings.utils.bpy_utils import ActionCurveFactory
 
     armatures = [
@@ -3161,7 +3246,13 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
 
     created_actions = []
 
-    for model_path, animation in animation_sources:
+    for animation_source in animation_sources:
+        if len(animation_source) == 3:
+            model_path, animation, post_delta = animation_source
+        else:
+            model_path, animation = animation_source
+            post_delta = False
+
         frame_count = int(getattr(animation, "frame_count", 0))
         bone_frames = getattr(animation, "frames", {}) or {}
 
@@ -3219,8 +3310,11 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
 
         for bone_name, frames in bone_frames.items():
             bone = armature.data.bones.get(bone_name)
-            if bone is None or frames is None:
+            pose_bone = armature.pose.bones.get(bone_name)
+            if bone is None or pose_bone is None or frames is None:
                 continue
+
+            pose_bone.rotation_mode = "QUATERNION"
 
             count = min(frame_count, len(frames))
             if count <= 0:
@@ -3233,6 +3327,14 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                 else Matrix.Identity(4)
             )
             rest_inverse = bone.matrix_local.inverted()
+            rest_local = (
+                parent_rest.inverted() @ bone.matrix_local
+                if parent is not None
+                else bone.matrix_local.copy()
+            )
+
+            rest_position = rest_local.to_translation()
+            rest_quaternion = rest_local.to_quaternion()
 
             positions = [[0.0] * count for _ in range(3)]
             rotations = [[0.0] * count for _ in range(4)]
@@ -3256,24 +3358,25 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
                 else:
                     quaternion.normalize()
 
-                if getattr(animation, "is_delta", False):
-                    if parent is None:
-                        position = root_rotation @ position
+                is_delta = bool(
+                    getattr(animation, "is_delta", False)
+                )
 
-                    location = rest_inverse @ position
+                if is_delta:
+                    position = rest_position + position
+                    if post_delta:
+                        quaternion = rest_quaternion @ quaternion
+                    else:
+                        quaternion = quaternion @ rest_quaternion
 
-                else:
-                    animated_local = (
-                        Matrix.Translation(position)
-                        @ quaternion.to_matrix().to_4x4()
-                    )
-                    armature_space = parent_rest @ animated_local
+                animated_local = (
+                    Matrix.Translation(position)
+                    @ quaternion.to_matrix().to_4x4()
+                )
 
-                    if parent is None:
-                        armature_space = root_rotation @ armature_space
-
-                    basis = rest_inverse @ armature_space
-                    location, quaternion, _ = basis.decompose()
+                armature_space = parent_rest @ animated_local
+                basis = rest_inverse @ armature_space
+                location, quaternion, _ = basis.decompose()
 
                 if not all(math.isfinite(float(v)) for v in location):
                     location = (
