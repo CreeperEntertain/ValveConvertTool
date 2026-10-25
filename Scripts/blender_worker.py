@@ -1723,8 +1723,156 @@ def _dependency_candidates(game_root, relative_path, desired_version):
     ]
 
 
+def _install_sourceio_frame_animation_compatibility():
+    """Decode constant and per-frame Source 1 animation channels together."""
+    import numpy as np
+
+    from SourceIO.library.models.mdl.structs.compressed_vectors import (
+        Quat48,
+        Quat48S,
+    )
+    from SourceIO.library.models.mdl.structs.frame_anim import StudioFrameAnim
+    from SourceIO.library.models.mdl.structs.local_animation import (
+        ANIM_DTYPE,
+        AniBoneFlags,
+        StudioAnimDesc,
+    )
+
+    if getattr(
+        StudioAnimDesc,
+        "_vct_frame_animation_compatibility",
+        False,
+    ):
+        return
+
+    def read_frame_animations(self, buffer, bones, section_frame_count):
+        try:
+            frame_count = max(0, int(section_frame_count))
+            entry_offset = buffer.tell()
+
+            frame_anim = StudioFrameAnim.from_buffer(buffer)
+            bone_flags = [
+                AniBoneFlags(buffer.read_uint8())
+                for _ in bones
+            ]
+
+            if frame_count == 0:
+                return None
+
+            has_constants = frame_anim.constant_offset > 0
+            has_frames = (
+                frame_anim.frame_offset > 0
+                and frame_anim.frame_length > 0
+            )
+
+            if not has_constants and not has_frames:
+                return None
+
+            animation_data = {}
+
+            def samples_for(bone):
+                samples = animation_data.get(bone.name)
+                if samples is None:
+                    samples = np.zeros(
+                        (frame_count,),
+                        dtype=ANIM_DTYPE,
+                    )
+                    animation_data[bone.name] = samples
+                return samples
+
+            if has_constants:
+                buffer.seek(entry_offset + frame_anim.constant_offset)
+
+                for bone in bones:
+                    flag = bone_flags[bone.bone_id]
+                    rotation = None
+                    position = None
+
+                    if flag & AniBoneFlags.CONST_ROT2:
+                        rotation = Quat48S.read(buffer)
+
+                    if flag & AniBoneFlags.RAW_ROT:
+                        rotation = Quat48.read(buffer)
+
+                    if flag & AniBoneFlags.RAW_POS:
+                        position = buffer.read_fmt("3e")
+
+                    if flag & AniBoneFlags.CONST_POS2:
+                        position = buffer.read_fmt("3f")
+
+                    if rotation is not None or position is not None:
+                        samples = samples_for(bone)
+
+                        if rotation is not None:
+                            samples["rot"] = rotation
+
+                        if position is not None:
+                            samples["pos"] = position
+
+            if has_frames:
+                frame_length = int(frame_anim.frame_length)
+
+                for frame_index in range(frame_count):
+                    frame_start = (
+                        entry_offset
+                        + frame_anim.frame_offset
+                        + frame_index * frame_length
+                    )
+                    buffer.seek(frame_start)
+
+                    for bone in bones:
+                        flag = bone_flags[bone.bone_id]
+                        rotation = None
+                        position = None
+
+                        if flag & AniBoneFlags.ANIM_ROT2:
+                            rotation = Quat48S.read(buffer)
+
+                        if flag & AniBoneFlags.ANIM_ROT:
+                            rotation = Quat48.read(buffer)
+
+                        if flag & AniBoneFlags.ANIM_POS:
+                            position = buffer.read_fmt("3e")
+
+                        if flag & AniBoneFlags.FULL_ANIM_POS:
+                            position = buffer.read_fmt("3f")
+
+                        if rotation is not None or position is not None:
+                            samples = samples_for(bone)
+
+                            if rotation is not None:
+                                samples[frame_index]["rot"] = rotation
+
+                            if position is not None:
+                                samples[frame_index]["pos"] = position
+
+                    consumed = buffer.tell() - frame_start
+                    if consumed > frame_length:
+                        raise ValueError(
+                            f"decoded frame uses {consumed} bytes, "
+                            f"but frame_length is {frame_length}"
+                        )
+
+            return animation_data or None
+
+        except Exception as exc:
+            print(
+                "[model] WARNING: Could not decode frame animation "
+                f"{getattr(self, 'name', '<unnamed>')!r}: "
+                f"{type(exc).__name__}: {exc}. "
+                "This animation will be skipped.",
+                flush=True,
+            )
+            return None
+
+    StudioAnimDesc._read_frame_animations = read_frame_animations
+    StudioAnimDesc._vct_frame_animation_compatibility = True
+
+
 def _load_mdl_for_pair_check(mdl_path):
     """Parse the MDL with the same SourceIO parser used for model import."""
+    _install_sourceio_frame_animation_compatibility()
+
     from SourceIO.library.utils import FileBuffer
     from SourceIO.library.utils.tiny_path import TinyPath
 
@@ -3023,15 +3171,13 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
         action_name = (
             f"{PurePosixPath(model_path).stem}_{animation.name}"
         )
-        action = bpy.data.actions.new(name=action_name)
+
         source_fps = _finite_number(
             getattr(animation, "fps", 30.0),
             30.0,
         )
         if source_fps <= 0.0:
             source_fps = 30.0
-
-        action["source_fps"] = source_fps
 
         scene = bpy.context.scene
         fps_base = _finite_number(scene.render.fps_base, 1.0)
@@ -3043,7 +3189,16 @@ def create_source1_animation_actions(armature_objects, animation_sources, scale=
         )
         frame_scale = gltf_frame_rate / source_fps
 
-        factory = ActionCurveFactory(action, armature)
+        factory = ActionCurveFactory(
+            armature.name,
+            armature,
+            legacy_behavior=True,
+        )
+        factory.new_action(action_name)
+
+        action = factory.action
+        action["source_fps"] = source_fps
+
         curve_count = 0
 
         for bone_name, frames in bone_frames.items():
