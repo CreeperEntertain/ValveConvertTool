@@ -1734,6 +1734,7 @@ def _install_sourceio_frame_animation_compatibility():
     from SourceIO.library.models.mdl.structs.frame_anim import StudioFrameAnim
     from SourceIO.library.models.mdl.structs.local_animation import (
         ANIM_DTYPE,
+        AnimDescFlags,
         AniBoneFlags,
         StudioAnimDesc,
     )
@@ -1769,16 +1770,35 @@ def _install_sourceio_frame_animation_compatibility():
                 return None
 
             animation_data = {}
+            is_delta = bool(self.flags & AnimDescFlags.DELTA)
 
             def samples_for(bone):
                 samples = animation_data.get(bone.name)
+
                 if samples is None:
                     samples = np.zeros(
                         (frame_count,),
                         dtype=ANIM_DTYPE,
                     )
+
+                    if is_delta:
+                        samples["pos"] = (0.0, 0.0, 0.0)
+                        samples["rot"] = (0.0, 0.0, 0.0, 1.0)
+                    else:
+                        samples["pos"] = tuple(
+                            float(v) for v in bone.position
+                        )
+                        samples["rot"] = tuple(
+                            float(v) for v in bone.quat
+                        )
+
                     animation_data[bone.name] = samples
+
                 return samples
+
+            if not is_delta:
+                for bone in bones:
+                    samples_for(bone)
 
             if has_constants:
                 buffer.seek(entry_offset + frame_anim.constant_offset)
