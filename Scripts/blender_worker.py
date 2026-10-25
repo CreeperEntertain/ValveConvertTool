@@ -28,6 +28,7 @@ from versioned_content import (
 )
 
 _PENDING_STAGING_DIRS = set()
+_VCT_VTX_INDEX_RECOVERY_ACTIVE = False
 
 
 def _cleanup_pending_staging_dirs():
@@ -1756,13 +1757,160 @@ def _load_mdl_for_pair_check(mdl_path):
     return mdl_format_version, mdl
 
 
-def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
-    """
-    Check whether the candidate VTX indices fit the VVD's model vertex ranges.
+def _install_sourceio_vtx_index_recovery():
+    """Install a worker-local shim that drops triangles with invalid VVD indices."""
+    import importlib
 
-    This mirrors the indexing operation that otherwise raises IndexError
-    inside SourceIO's MDL importer.
-    """
+    common = importlib.import_module(
+        "SourceIO.blender_bindings.models.common"
+    )
+    current_merge = common.merge_meshes
+
+    if getattr(current_merge, "_vct_recovery_wrapper", False):
+        recovery_merge = current_merge
+        original_merge = current_merge._vct_original_merge
+    else:
+        original_merge = current_merge
+
+        def recovery_merge(model, vtx_model):
+            vtx_vertices, indices, materials = original_merge(
+                model, vtx_model
+            )
+
+            if not _VCT_VTX_INDEX_RECOVERY_ACTIVE:
+                return vtx_vertices, indices, materials
+
+            import numpy as np
+
+            source_vertices = np.asarray(
+                vtx_vertices, dtype=np.int64
+            ).reshape(-1)
+            render_indices = np.asarray(
+                indices, dtype=np.int64
+            ).reshape(-1)
+            material_indices = np.asarray(
+                materials
+            ).reshape(-1)
+
+            if render_indices.size % 3:
+                raise RuntimeError(
+                    f"Cannot recover VTX geometry for {model.name!r}: "
+                    "the index buffer contains incomplete triangles."
+                )
+
+            triangles = render_indices.reshape((-1, 3))
+
+            invalid_source = (
+                (source_vertices < 0)
+                | (source_vertices >= int(model.vertex_count))
+            )
+            invalid_render = (
+                (render_indices < 0)
+                | (render_indices >= len(source_vertices))
+            )
+
+            if not invalid_source.any() and not invalid_render.any():
+                return vtx_vertices, indices, materials
+
+            if len(material_indices) != len(triangles):
+                raise RuntimeError(
+                    f"Cannot recover VTX geometry for {model.name!r}: "
+                    "triangle and material counts do not match."
+                )
+
+            valid_triangles = np.all(
+                (triangles >= 0)
+                & (triangles < len(source_vertices)),
+                axis=1,
+            )
+
+            candidate_rows = np.flatnonzero(valid_triangles)
+
+            if candidate_rows.size:
+                mapped_vertices = source_vertices[
+                    triangles[candidate_rows]
+                ]
+                valid_triangles[candidate_rows] = np.all(
+                    (mapped_vertices >= 0)
+                    & (mapped_vertices < int(model.vertex_count)),
+                    axis=1,
+                )
+
+            retained = triangles[valid_triangles]
+
+            if retained.size == 0:
+                raise RuntimeError(
+                    f"Cannot recover VTX geometry for {model.name!r}: "
+                    "no valid triangles remain after filtering invalid "
+                    "VVD/VTX indices."
+                )
+
+            used_render_vertices = np.unique(retained)
+            remap = np.full(
+                len(source_vertices), -1, dtype=np.int64
+            )
+            remap[used_render_vertices] = np.arange(
+                len(used_render_vertices), dtype=np.int64
+            )
+
+            repaired_vertices = source_vertices[
+                used_render_vertices
+            ].tolist()
+            repaired_indices = remap[retained].reshape(-1)
+            repaired_materials = material_indices[valid_triangles]
+
+            print(
+                f"[model] WARNING: Recovered mismatched VVD/VTX data "
+                f"for {model.name!r}; discarded "
+                f"{int((~valid_triangles).sum())} invalid triangle(s).",
+                flush=True,
+            )
+
+            return (
+                repaired_vertices,
+                repaired_indices,
+                repaired_materials,
+            )
+
+        recovery_merge._vct_recovery_wrapper = True
+        recovery_merge._vct_original_merge = original_merge
+        common.merge_meshes = recovery_merge
+
+    for module in tuple(sys.modules.values()):
+        if module is None:
+            continue
+
+        module_name = getattr(module, "__name__", "")
+        if not module_name.startswith(
+            "SourceIO.blender_bindings.models."
+        ):
+            continue
+
+        if getattr(module, "merge_meshes", None) is original_merge:
+            module.merge_meshes = recovery_merge
+
+
+@contextmanager
+def sourceio_vtx_index_recovery(enabled):
+    """Enable the worker-local recovery shim for one SourceIO import."""
+    global _VCT_VTX_INDEX_RECOVERY_ACTIVE
+
+    if not enabled:
+        yield
+        return
+
+    _install_sourceio_vtx_index_recovery()
+    previous = _VCT_VTX_INDEX_RECOVERY_ACTIVE
+    _VCT_VTX_INDEX_RECOVERY_ACTIVE = True
+
+    try:
+        yield
+    finally:
+        _VCT_VTX_INDEX_RECOVERY_ACTIVE = previous
+
+
+def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
+    """Validate a pair and identify whether bad vertex indices are recoverable."""
     from SourceIO.blender_bindings.models.common import merge_meshes
     from SourceIO.library.models.vtx import open_vtx
     from SourceIO.library.models.vvd import Vvd
@@ -1781,23 +1929,30 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
         return False, (
             f"VTX body-part count {len(vtx.body_parts)} does not match "
             f"MDL count {len(mdl.body_parts)}"
-        )
+        ), None
 
+    info = {
+        "invalid_vertex_references": 0,
+        "total_vertex_references": 0,
+        "invalid_render_indices": 0,
+        "total_render_indices": 0,
+        "invalid_triangles": 0,
+        "total_triangles": 0,
+    }
+    recovery_reasons = []
     checked_models = 0
 
     for vtx_body_part, body_part in zip(
-        vtx.body_parts,
-        mdl.body_parts,
+        vtx.body_parts, mdl.body_parts
     ):
         if len(vtx_body_part.models) != len(body_part.models):
             return False, (
                 f"VTX model count does not match MDL body part "
                 f"{body_part.name!r}"
-            )
+            ), None
 
         for vtx_model, model in zip(
-            vtx_body_part.models,
-            body_part.models,
+            vtx_body_part.models, body_part.models
         ):
             if model.vertex_count == 0:
                 continue
@@ -1805,7 +1960,7 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
             if not vtx_model.model_lods:
                 return False, (
                     f"VTX model {model.name!r} has no LOD data"
-                )
+                ), None
 
             start = model.vertex_offset
             end = start + model.vertex_count
@@ -1815,34 +1970,85 @@ def _check_vvd_vtx_compatibility(mdl, vvd_path, vtx_path):
                 return False, (
                     f"MDL model {model.name!r} requests vertices "
                     f"[{start}:{end}], but the VVD does not contain "
-                    f"that range"
-                )
+                    "that range"
+                ), None
 
             try:
-                vtx_vertices, _, _ = merge_meshes(
-                    model,
-                    vtx_model.model_lods[0],
+                vtx_vertices, indices, _ = merge_meshes(
+                    model, vtx_model.model_lods[0]
                 )
             except Exception as exc:
                 return False, (
                     f"Could not build VTX indices for {model.name!r}: "
                     f"{type(exc).__name__}: {exc}"
-                )
+                ), None
 
-            if vtx_vertices:
-                lowest = min(vtx_vertices)
-                highest = max(vtx_vertices)
+            vtx_vertices = [int(value) for value in vtx_vertices]
+            indices = [int(value) for value in indices]
 
-                if lowest < 0 or highest >= len(model_vertices):
-                    return False, (
-                        f"VTX index range {lowest}..{highest} exceeds "
-                        f"the VVD model vertex range 0.."
-                        f"{len(model_vertices) - 1} for {model.name!r}"
-                    )
+            if len(indices) % 3:
+                return False, (
+                    f"VTX index buffer for {model.name!r} does not "
+                    "contain complete triangles"
+                ), None
 
+            invalid_vertices = sum(
+                value < 0 or value >= len(model_vertices)
+                for value in vtx_vertices
+            )
+            invalid_indices = sum(
+                value < 0 or value >= len(vtx_vertices)
+                for value in indices
+            )
+
+            triangle_count = len(indices) // 3
+            valid_triangle_count = 0
+
+            for offset in range(0, len(indices), 3):
+                triangle_valid = True
+
+                for render_index in indices[offset:offset + 3]:
+                    if render_index < 0 or render_index >= len(vtx_vertices):
+                        triangle_valid = False
+                        continue
+
+                    vertex_index = vtx_vertices[render_index]
+                    if (
+                        vertex_index < 0
+                        or vertex_index >= len(model_vertices)
+                    ):
+                        triangle_valid = False
+
+                if triangle_valid:
+                    valid_triangle_count += 1
+
+            info["invalid_vertex_references"] += invalid_vertices
+            info["total_vertex_references"] += len(vtx_vertices)
+            info["invalid_render_indices"] += invalid_indices
+            info["total_render_indices"] += len(indices)
+            info["invalid_triangles"] += (
+                triangle_count - valid_triangle_count
+            )
+            info["total_triangles"] += triangle_count
             checked_models += 1
 
-    return True, f"checked {checked_models} model(s)"
+            if invalid_vertices or invalid_indices:
+                recovery_reasons.append(
+                    f"VTX/VVD index mismatch for {model.name!r}: "
+                    f"{invalid_vertices} invalid vertex reference(s), "
+                    f"{invalid_indices} invalid render index value(s)"
+                )
+
+                if triangle_count == 0 or valid_triangle_count == 0:
+                    return False, (
+                        f"VTX/VVD mismatch for {model.name!r} leaves no "
+                        "valid triangles to import"
+                    ), None
+
+    if recovery_reasons:
+        return False, "; ".join(recovery_reasons), info
+
+    return True, f"checked {checked_models} model(s)", None
 
 
 def _select_compatible_model_dependencies(
@@ -1851,7 +2057,7 @@ def _select_compatible_model_dependencies(
     model_relative_to_game,
     model_version,
 ):
-    """Select the preferred eligible VVD/VTX pair that passes index checks."""
+    """Prefer a fully compatible pair; otherwise choose the safest recoverable pair."""
     mdl_format_version, mdl = _load_mdl_for_pair_check(
         physical_model_path
     )
@@ -1888,14 +2094,10 @@ def _select_compatible_model_dependencies(
     )
 
     vtx_candidates = []
-
     for suffix in vtx_suffixes:
         relative = model_path.with_suffix(suffix)
-
         for version, path in _dependency_candidates(
-            game_root,
-            relative,
-            model_version,
+            game_root, relative, model_version
         ):
             vtx_candidates.append((suffix, version, path))
 
@@ -1908,7 +2110,7 @@ def _select_compatible_model_dependencies(
     if mdl_format_version == 36:
         selected_vtx = vtx_candidates[0]
         selected_vvd = vvd_candidates[0] if vvd_candidates else None
-        return selected_vvd, selected_vtx
+        return selected_vvd, selected_vtx, False
 
     if not vvd_candidates:
         raise FileNotFoundError(
@@ -1917,39 +2119,90 @@ def _select_compatible_model_dependencies(
         )
 
     if mdl is None:
-        return vvd_candidates[0], vtx_candidates[0]
+        return vvd_candidates[0], vtx_candidates[0], False
 
     attempted = []
+    recovery_candidates = []
 
     for vtx_candidate in vtx_candidates:
-        vtx_suffix, vtx_version, vtx_path = vtx_candidate
+        for vvd_candidate in vvd_candidates:
+            vtx_suffix, vtx_version, vtx_path = vtx_candidate
+            vvd_version, vvd_path = vvd_candidate
 
-        for vvd_version, vvd_path in vvd_candidates:
             try:
-                compatible, reason = _check_vvd_vtx_compatibility(
-                    mdl,
-                    vvd_path,
-                    vtx_path,
+                compatible, reason, recovery_info = (
+                    _check_vvd_vtx_compatibility(
+                        mdl, vvd_path, vtx_path
+                    )
                 )
             except Exception as exc:
                 compatible = False
                 reason = f"{type(exc).__name__}: {exc}"
+                recovery_info = None
 
             if compatible:
-                return (
-                    (vvd_version, vvd_path),
-                    (vtx_suffix, vtx_version, vtx_path),
-                )
+                return vvd_candidate, vtx_candidate, False
 
             attempted.append(
                 f"VTX {vtx_path} + VVD {vvd_path}: {reason}"
             )
 
+            if recovery_info is not None:
+                invalid_triangles = recovery_info["invalid_triangles"]
+                total_triangles = recovery_info["total_triangles"]
+                invalid_vertices = recovery_info[
+                    "invalid_vertex_references"
+                ]
+                total_vertices = recovery_info[
+                    "total_vertex_references"
+                ]
+                invalid_indices = recovery_info[
+                    "invalid_render_indices"
+                ]
+                total_indices = recovery_info["total_render_indices"]
+
+                score = (
+                    invalid_triangles / max(total_triangles, 1),
+                    (
+                        invalid_vertices + invalid_indices
+                    ) / max(total_vertices + total_indices, 1),
+                    invalid_triangles,
+                    invalid_vertices,
+                    invalid_indices,
+                )
+
+                recovery_candidates.append((
+                    score,
+                    vvd_candidate,
+                    vtx_candidate,
+                    reason,
+                    recovery_info,
+                ))
+
+    if recovery_candidates:
+        (
+            _score,
+            selected_vvd,
+            selected_vtx,
+            reason,
+            info,
+        ) = min(recovery_candidates, key=lambda item: item[0])
+
+        print(
+            f"[model] WARNING: No fully compatible VVD/VTX pair exists "
+            f"for {physical_model_path}. Using the least-damaged "
+            "recoverable pair. Invalid triangles: "
+            f"{info['invalid_triangles']} of "
+            f"{info['total_triangles']}. Details: {reason}",
+            flush=True,
+        )
+        return selected_vvd, selected_vtx, True
+
     details = "\n".join(f"  - {line}" for line in attempted[:8])
 
     raise RuntimeError(
-        f"No compatible VVD/VTX pair was found for {physical_model_path} "
-        f"at model version {model_version}.\n"
+        f"No compatible or safely recoverable VVD/VTX pair was found "
+        f"for {physical_model_path} at model version {model_version}.\n"
         f"Tested {len(attempted)} candidate pair(s).\n{details}"
     )
 
@@ -2198,11 +2451,13 @@ def stage_versioned_model(input_root, input_path):
     if physical_model_path is None or not physical_model_path.is_file():
         raise FileNotFoundError(f"Cannot resolve MDL: {input_path}")
 
-    selected_vvd, selected_vtx = _select_compatible_model_dependencies(
-        physical_model_path,
-        game_root,
-        model_relative_to_game,
-        model_version,
+    selected_vvd, selected_vtx, recover_vtx_indices = (
+        _select_compatible_model_dependencies(
+            physical_model_path,
+            game_root,
+            model_relative_to_game,
+            model_version,
+        )
     )
 
     temporary = tempfile.TemporaryDirectory(prefix="vct-model-")
@@ -2259,7 +2514,13 @@ def stage_versioned_model(input_root, input_path):
             flush=True,
         )
 
-        return temporary, staged_model, game_root, model_version
+        return (
+            temporary,
+            staged_model,
+            game_root,
+            model_version,
+            recover_vtx_indices,
+        )
 
     except Exception:
         _cleanup_staging_directory(temporary)
@@ -2938,9 +3199,13 @@ def import_model(input_root, input_path, output_path, output_root):
 
     ensure_parent(output_path)
 
-    temporary, staged_model, game_root, model_version = (
-        stage_versioned_model(input_root, input_path)
-    )
+    (
+        temporary,
+        staged_model,
+        game_root,
+        model_version,
+        recover_vtx_indices,
+    ) = stage_versioned_model(input_root, input_path)
 
     try:
         source_mdl_version, source_mdl = _load_mdl_for_pair_check(
@@ -2988,16 +3253,17 @@ def import_model(input_root, input_path, output_path, output_root):
             content_manager,
             versioned_provider,
         ):
-            operator_result = bpy.ops.sourceio.mdl(
-                directory=model_directory,
-                files=[
-                    {"name": os.path.basename(resolved_input_path)}
-                ],
-                discover_resources=False,
-                import_textures=True,
-                import_animations=False,
-                import_include_animations=False,
-            )
+            with sourceio_vtx_index_recovery(recover_vtx_indices):
+                operator_result = bpy.ops.sourceio.mdl(
+                    directory=model_directory,
+                    files=[
+                        {"name": os.path.basename(resolved_input_path)}
+                    ],
+                    discover_resources=False,
+                    import_textures=True,
+                    import_animations=False,
+                    import_include_animations=False,
+                )
 
             if (
                 "CANCELLED" not in operator_result
