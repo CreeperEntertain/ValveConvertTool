@@ -22,8 +22,9 @@ if _WORKER_DIR not in sys.path:
 
 from versioned_content import (
     DEFAULT_VERSIONED_CONTENT_VIEWS,
-    _find_variants,
-    choose_version,
+    dependency_candidates as _metadata_dependency_candidates,
+    get_selection_context,
+    resolve_dependency_path as _metadata_resolve_dependency_path,
     split_versioned_relative,
 )
 
@@ -1675,26 +1676,15 @@ def resolve_dependency_file(game_root, relative_path, model_version):
     if relative.is_absolute() or ".." in relative.parts:
         return None
 
-    logical_path = Path(game_root).joinpath(*relative.parts)
-
-    if logical_path.is_file():
-        return logical_path
-
-    variants = _find_variants(logical_path)
-
-    if not variants:
-        return None
-
-    selected = choose_version(
-        variants.keys(),
+    return _metadata_resolve_dependency_path(
+        game_root,
+        relative.as_posix(),
         model_version,
     )
 
-    return variants[selected] if selected is not None else None
-
 
 def _dependency_candidates(game_root, relative_path, desired_version):
-    """Return dependency candidates from newest eligible version downward."""
+    """Return dependency candidates newest-to-oldest in the requested history."""
     relative = PurePosixPath(
         str(relative_path).replace("\\", "/")
     )
@@ -1702,25 +1692,11 @@ def _dependency_candidates(game_root, relative_path, desired_version):
     if relative.is_absolute() or ".." in relative.parts:
         return []
 
-    logical_path = Path(game_root).joinpath(*relative.parts)
-
-    if logical_path.is_file():
-        return [(None, logical_path)]
-
-    variants = _find_variants(logical_path)
-    if not variants:
-        return []
-
-    eligible = [
-        version
-        for version in variants
-        if desired_version is None or version <= desired_version
-    ]
-
-    return [
-        (version, variants[version])
-        for version in sorted(eligible, reverse=True)
-    ]
+    return _metadata_dependency_candidates(
+        game_root,
+        relative.as_posix(),
+        desired_version,
+    )
 
 
 def _install_sourceio_frame_animation_compatibility():
@@ -2529,7 +2505,7 @@ def _select_compatible_model_dependencies(
 
 
 def get_versioned_game_context(input_root, input_path):
-    """Return the physical input, game root, logical path, and requested version."""
+    """Return the physical input, game root, logical path, and history context."""
     archive_root = Path(input_root).resolve()
     source_path = Path(input_path).resolve()
 
@@ -2582,11 +2558,17 @@ def get_versioned_game_context(input_root, input_path):
             f"Expected game content root does not exist: {game_root}"
         )
 
+    selection_context = get_selection_context(
+        archive_root,
+        source_path,
+        desired_version,
+    )
+
     return (
         source_path,
         game_root,
         relative_to_game,
-        desired_version,
+        selection_context,
     )
 
 
@@ -3868,7 +3850,7 @@ def import_bsp(input_root, input_path, output_path, output_root):
         input_path,
     )
 
-    resolved_root, resolved_filename, map_version = (
+    resolved_root, resolved_filename, _ = (
         DEFAULT_VERSIONED_CONTENT_VIEWS.resolve(
             input_root,
             relative_path,
@@ -3880,7 +3862,7 @@ def import_bsp(input_root, input_path, output_path, output_root):
         *PurePosixPath(resolved_filename).parts,
     )
 
-    _, game_root, _, _ = get_versioned_game_context(
+    _, game_root, _, map_version = get_versioned_game_context(
         input_root,
         input_path,
     )

@@ -62,6 +62,8 @@ internal sealed class AssetScanner
             SearchOption.AllDirectories))
         {
             var relativePath = Path.GetRelativePath(root, path);
+            if (string.Equals(Path.GetFileName(path), ".valve-diff-metadata.json", StringComparison.OrdinalIgnoreCase))
+                continue;
 
             assets.Add(new AssetFile(
                 path,
