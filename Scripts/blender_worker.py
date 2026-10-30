@@ -1281,13 +1281,13 @@ def _prepare_bake_uv_layout(obj):
         bpy.ops.mesh.select_all(action="SELECT")
 
         result = bpy.ops.uv.smart_project(
-            angle_limit=math.radians(66.0),
+            angle_limit=math.radians(45.0),
             margin_method="FRACTION",
             rotate_method="AXIS_ALIGNED_Y",
-            island_margin=0.005,
-            area_weight=0.0,
+            island_margin=0.002,
+            area_weight=1.0,
             correct_aspect=True,
-            scale_to_bounds=True,
+            scale_to_bounds=False,
         )
 
         if "CANCELLED" in result:
