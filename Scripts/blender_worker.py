@@ -1082,12 +1082,518 @@ def _replace_shader_leaves_for_bake(node_tree, channel):
             )
 
 
+def _read_uv_layer_values(mesh, layer_name):
+    """Read one UV layer into independent Python-owned storage."""
+    from array import array
+
+    layer = mesh.uv_layers.get(layer_name)
+    if layer is None:
+        raise RuntimeError(
+            f"UV layer {layer_name!r} does not exist."
+        )
+
+    values = array(
+        "f", [0.0]
+    ) * (len(layer.data) * 2)
+
+    if values:
+        layer.data.foreach_get("uv", values)
+
+    return values
+
+
+def _uv_bounds(values):
+    """Return min U, max U, min V, max V."""
+    if not values:
+        raise ValueError("Cannot calculate bounds of an empty UV layer.")
+
+    return (
+        min(values[0::2]),
+        max(values[0::2]),
+        min(values[1::2]),
+        max(values[1::2]),
+    )
+
+
+def _uv_area_by_material(mesh, values):
+    """
+    Sum absolute UV polygon areas, grouped by material index.
+    """
+    areas = {}
+
+    for polygon in mesh.polygons:
+        start = polygon.loop_start
+        count = polygon.loop_total
+
+        if count < 3:
+            continue
+
+        twice_area = 0.0
+
+        for offset in range(count):
+            current = start + offset
+            following = start + ((offset + 1) % count)
+
+            u1 = values[current * 2]
+            v1 = values[current * 2 + 1]
+            u2 = values[following * 2]
+            v2 = values[following * 2 + 1]
+
+            twice_area += u1 * v2 - u2 * v1
+
+        area = abs(twice_area) * 0.5
+
+        material_index = polygon.material_index
+        areas[material_index] = (
+            areas.get(material_index, 0.0) + area
+        )
+
+    return areas
+
+
+def _set_active_uv_layer(mesh, layer_name):
+    """
+    Make one UV layer both active and active-render.
+    """
+    index = mesh.uv_layers.find(layer_name)
+
+    if index < 0:
+        raise RuntimeError(
+            f"Cannot activate missing UV layer {layer_name!r}."
+        )
+
+    mesh.uv_layers.active_index = index
+
+    for layer in mesh.uv_layers:
+        layer.active_render = (layer.name == layer_name)
+
+
+def _prepare_bake_uv_layout(obj):
+    """
+    Preserve all original UV maps and generate an independent bake atlas.
+    """
+    mesh = obj.data
+
+    if obj.type != "MESH":
+        raise TypeError(
+            f"Expected a mesh object, got {obj.type!r}."
+        )
+
+    if obj.mode != "OBJECT":
+        raise RuntimeError(
+            f"Cannot prepare UVs for {obj.name!r}: "
+            "the object must be in Object Mode."
+        )
+
+    if len(mesh.uv_layers) == 0:
+        raise RuntimeError(
+            f"Cannot bake {obj.name!r}: SourceIO supplied no UV maps."
+        )
+
+    source_active_layer = mesh.uv_layers.active
+    if source_active_layer is None:
+        source_active_layer = mesh.uv_layers[0]
+
+    source_render_layer = next(
+        (
+            layer
+            for layer in mesh.uv_layers
+            if layer.active_render
+        ),
+        source_active_layer,
+    )
+
+    source_active_name = source_active_layer.name
+    source_render_name = source_render_layer.name
+
+    source_snapshots = {}
+    source_areas = {}
+
+    expected_value_count = len(mesh.loops) * 2
+
+    for layer in mesh.uv_layers:
+        layer_name = layer.name
+        values = _read_uv_layer_values(mesh, layer_name)
+
+        if len(values) != expected_value_count:
+            raise RuntimeError(
+                f"UV layer {layer_name!r} on {obj.name!r} has "
+                f"{len(values) // 2} UV loops; expected "
+                f"{len(mesh.loops)}."
+            )
+
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError(
+                f"UV layer {layer_name!r} on {obj.name!r} "
+                "contains non-finite coordinates."
+            )
+
+        source_snapshots[layer_name] = values
+        source_areas[layer_name] = _uv_area_by_material(
+            mesh,
+            values,
+        )
+
+    bake_name = "VCT_BakeUV"
+    suffix = 1
+
+    while mesh.uv_layers.get(bake_name) is not None:
+        bake_name = f"VCT_BakeUV_{suffix}"
+        suffix += 1
+
+    previous_selected = tuple(
+        bpy.context.selected_objects
+    )
+    previous_active = (
+        bpy.context.view_layer.objects.active
+    )
+
+    layer_created = False
+
+    try:
+        for selected in bpy.context.selected_objects:
+            selected.select_set(False)
+
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        bpy.context.view_layer.update()
+
+        mesh = obj.data
+        mesh.uv_layers.new(
+            name=bake_name,
+            do_init=False,
+        )
+        layer_created = True
+
+        _set_active_uv_layer(mesh, bake_name)
+
+        mesh.update()
+        bpy.context.view_layer.update()
+
+        mode_result = bpy.ops.object.mode_set(mode="EDIT")
+        if "CANCELLED" in mode_result:
+            raise RuntimeError(
+                f"Could not enter Edit Mode for UV atlas generation "
+                f"on {obj.name!r}."
+            )
+
+        bpy.ops.mesh.select_all(action="SELECT")
+
+        result = bpy.ops.uv.smart_project(
+            angle_limit=math.radians(66.0),
+            margin_method="FRACTION",
+            rotate_method="AXIS_ALIGNED_Y",
+            island_margin=0.005,
+            area_weight=0.0,
+            correct_aspect=True,
+            scale_to_bounds=True,
+        )
+
+        if "CANCELLED" in result:
+            raise RuntimeError(
+                f"Blender cancelled Smart UV Project for {obj.name!r}."
+            )
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        mesh = obj.data
+
+        for layer_name, before in source_snapshots.items():
+            after = _read_uv_layer_values(mesh, layer_name)
+
+            if (
+                len(after) != len(before)
+                or any(
+                    abs(old - new) > 1e-6
+                    for old, new in zip(before, after)
+                )
+            ):
+                raise RuntimeError(
+                    f"UV atlas generation modified original UV map "
+                    f"{layer_name!r} on {obj.name!r}. "
+                    "The original source UVs must remain unchanged."
+                )
+
+        bake_values = _read_uv_layer_values(
+            mesh,
+            bake_name,
+        )
+
+        if len(bake_values) != expected_value_count:
+            raise RuntimeError(
+                f"Generated bake UV map {bake_name!r} on {obj.name!r} "
+                "has an incorrect loop count."
+            )
+
+        if not all(math.isfinite(value) for value in bake_values):
+            raise RuntimeError(
+                f"Generated bake UV map {bake_name!r} on {obj.name!r} "
+                "contains non-finite coordinates."
+            )
+
+        bake_bounds = _uv_bounds(bake_values)
+
+        if any(
+            value < -1e-5 or value > 1.0 + 1e-5
+            for value in bake_values
+        ):
+            raise RuntimeError(
+                f"Generated bake UV map {bake_name!r} on {obj.name!r} "
+                f"is outside 0..1: {bake_bounds}"
+            )
+
+        bake_areas = _uv_area_by_material(
+            mesh,
+            bake_values,
+        )
+
+        for polygon in mesh.polygons:
+            if polygon.area <= 1e-12:
+                continue
+
+            if bake_areas.get(polygon.material_index, 0.0) <= 1e-12:
+                raise RuntimeError(
+                    f"Generated bake UV map has no usable coverage for "
+                    f"material slot {polygon.material_index} on "
+                    f"{obj.name!r}."
+                )
+
+        _set_active_uv_layer(mesh, bake_name)
+
+        print(
+            f"[uv-bake] {obj.name!r}: "
+            f"source_active={source_active_name!r}; "
+            f"source_render={source_render_name!r}; "
+            f"source_active_bounds="
+            f"{_uv_bounds(source_snapshots[source_active_name])}; "
+            f"bake={bake_name!r}; "
+            f"bake_bounds={bake_bounds}; "
+            f"preserved_source_uv_maps={len(source_snapshots)}",
+            flush=True,
+        )
+
+        return (
+            source_active_name,
+            source_render_name,
+            bake_name,
+            source_areas,
+            bake_areas,
+        )
+
+    except Exception:
+        if obj.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        if layer_created:
+            mesh = obj.data
+            generated_layer = mesh.uv_layers.get(bake_name)
+
+            if generated_layer is not None:
+                mesh.uv_layers.remove(generated_layer)
+
+        raise
+
+    finally:
+        if obj.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        for selected in bpy.context.selected_objects:
+            selected.select_set(False)
+
+        for selected in previous_selected:
+            if (
+                bpy.context.view_layer.objects.get(selected.name)
+                is not None
+            ):
+                selected.select_set(True)
+
+        if (
+            previous_active is not None
+            and bpy.context.view_layer.objects.get(previous_active.name)
+            is not None
+        ):
+            bpy.context.view_layer.objects.active = previous_active
+        else:
+            bpy.context.view_layer.objects.active = None
+
+
+def _pin_material_uv_sampling(
+    node_tree,
+    source_active_uv_name,
+    source_render_uv_name,
+    visited=None,
+):
+    """
+    Make all source material coordinate sampling independent of the
+    active bake UV map.
+    """
+    if node_tree is None:
+        return {
+            "image_inputs": 0,
+            "uv_map_nodes": 0,
+            "texture_coordinate_nodes": 0,
+        }
+
+    if visited is None:
+        visited = set()
+
+    pointer = node_tree.as_pointer()
+    if pointer in visited:
+        return {
+            "image_inputs": 0,
+            "uv_map_nodes": 0,
+            "texture_coordinate_nodes": 0,
+        }
+
+    visited.add(pointer)
+
+    counts = {
+        "image_inputs": 0,
+        "uv_map_nodes": 0,
+        "texture_coordinate_nodes": 0,
+    }
+
+    uv_nodes = {}
+
+    def get_uv_node(uv_name):
+        uv_node = uv_nodes.get(uv_name)
+
+        if uv_node is None:
+            uv_node = node_tree.nodes.new("ShaderNodeUVMap")
+            uv_node.name = f"VCT Source UV {uv_name}"
+            uv_node.label = f"VCT Source UV: {uv_name}"
+            uv_node.uv_map = uv_name
+            uv_nodes[uv_name] = uv_node
+
+        return uv_node
+
+    for node in list(node_tree.nodes):
+        if node.type == "GROUP" and node.node_tree is not None:
+            nested = _pin_material_uv_sampling(
+                node.node_tree,
+                source_active_uv_name,
+                source_render_uv_name,
+                visited,
+            )
+
+            for key, value in nested.items():
+                counts[key] += value
+
+        elif node.type == "UVMAP":
+            if not str(node.uv_map or "").strip():
+                node.uv_map = source_render_uv_name
+                counts["uv_map_nodes"] += 1
+
+        elif node.type == "TEX_COORD":
+            uv_output = node.outputs.get("UV")
+
+            if uv_output is not None and uv_output.is_linked:
+                source_node = get_uv_node(source_render_uv_name)
+
+                for link in list(uv_output.links):
+                    destination = link.to_socket
+                    node_tree.links.remove(link)
+                    node_tree.links.new(
+                        source_node.outputs["UV"],
+                        destination,
+                    )
+
+                counts["texture_coordinate_nodes"] += 1
+
+        elif node.type == "TEX_IMAGE" and node.image is not None:
+            vector = node.inputs.get("Vector")
+
+            if vector is not None and not vector.is_linked:
+                source_node = get_uv_node(source_active_uv_name)
+
+                node_tree.links.new(
+                    source_node.outputs["UV"],
+                    vector,
+                )
+
+                counts["image_inputs"] += 1
+
+    return counts
+
+
+def _choose_material_bake_resolution(
+    source_images,
+    material_slot_index,
+    source_uv_areas,
+    bake_uv_areas,
+):
+    """
+    Estimate atlas resolution from source UV texel area versus destination
+    atlas area. The 4096 cap prevents unbounded image allocation.
+    """
+    base_resolution = max(
+        [512]
+        + [
+            max(int(image.size[0]), int(image.size[1]))
+            for image in source_images
+            if image.size[0] > 0 and image.size[1] > 0
+        ]
+    )
+
+    source_area = max(
+        (
+            material_areas.get(material_slot_index, 0.0)
+            for material_areas in source_uv_areas.values()
+        ),
+        default=0.0,
+    )
+
+    bake_area = bake_uv_areas.get(material_slot_index, 0.0)
+
+    if source_area > 1e-12 and bake_area <= 1e-12:
+        raise RuntimeError(
+            f"Material slot {material_slot_index} has source UV area "
+            "but no corresponding bake atlas area."
+        )
+
+    requested_resolution = base_resolution
+
+    if source_area > 1e-12 and bake_area > 1e-12:
+        density_scale = math.sqrt(source_area / bake_area)
+        requested_resolution = max(
+            base_resolution,
+            math.ceil(base_resolution * density_scale),
+        )
+
+    maximum_resolution = 4096
+    resolution = max(
+        64,
+        min(maximum_resolution, requested_resolution),
+    )
+
+    if requested_resolution > maximum_resolution:
+        print(
+            f"[material] WARNING: Estimated bake resolution "
+            f"{requested_resolution} exceeds the "
+            f"{maximum_resolution} limit for material slot "
+            f"{material_slot_index}; the atlas will have reduced "
+            "texel density.",
+            flush=True,
+        )
+
+    return (
+        resolution,
+        requested_resolution,
+        source_area,
+        bake_area,
+    )
+
+
 def _bake_source_material_channel(
     obj,
     slot_index,
     source_material,
     channel,
     resolution,
+    source_active_uv_name,
+    source_render_uv_name,
+    bake_uv_name,
 ):
     """Bake one evaluated channel into a texture."""
     temporary_material = source_material.copy()
@@ -1110,6 +1616,21 @@ def _bake_source_material_channel(
     try:
         created_groups = _clone_material_groups(
             temporary_material.node_tree
+        )
+
+        uv_pin_counts = _pin_material_uv_sampling(
+            temporary_material.node_tree,
+            source_active_uv_name,
+            source_render_uv_name,
+        )
+
+        print(
+            f"[uv-source] {obj.name!r} / {source_material.name!r}: "
+            f"pinned_image_inputs={uv_pin_counts['image_inputs']}; "
+            f"pinned_uv_map_nodes={uv_pin_counts['uv_map_nodes']}; "
+            f"pinned_texture_coordinate_nodes="
+            f"{uv_pin_counts['texture_coordinate_nodes']}",
+            flush=True,
         )
 
         if channel != "normal":
@@ -1180,6 +1701,11 @@ def _bake_source_material_channel(
 
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
+
+        _set_active_uv_layer(
+            obj.data,
+            bake_uv_name,
+        )
 
         scene.render.engine = "CYCLES"
         scene.cycles.samples = 1
@@ -1265,11 +1791,13 @@ def prepare_materials_for_gltf(mesh_objects):
         if obj.type != "MESH":
             continue
 
-        if len(obj.data.uv_layers) == 0:
-            raise RuntimeError(
-                f"Cannot bake material channels for {obj.name!r}: "
-                "the mesh has no UV map."
-            )
+        (
+            source_active_uv_name,
+            source_render_uv_name,
+            bake_uv_name,
+            source_uv_areas,
+            bake_uv_areas,
+        ) = _prepare_bake_uv_layout(obj)
 
         for slot_index, slot in enumerate(obj.material_slots):
             source = slot.material
@@ -1302,18 +1830,26 @@ def prepare_materials_for_gltf(mesh_objects):
                 )
             ]
 
-            resolution = max(
-                [512]
-                + [
-                    max(
-                        int(image.size[0]),
-                        int(image.size[1]),
-                    )
-                    for image in source_images
-                    if image.size[0] > 0 and image.size[1] > 0
-                ]
+            (
+                resolution,
+                requested_resolution,
+                source_uv_area,
+                bake_uv_area,
+            ) = _choose_material_bake_resolution(
+                source_images,
+                slot_index,
+                source_uv_areas,
+                bake_uv_areas,
             )
-            resolution = max(64, min(2048, resolution))
+
+            print(
+                f"[material] UV density estimate for {source.name!r}: "
+                f"source_area={source_uv_area:.6f}; "
+                f"bake_area={bake_uv_area:.6f}; "
+                f"requested={requested_resolution}; "
+                f"actual={resolution}",
+                flush=True,
+            )
 
             print(
                 f"[material] Baking {source.name!r} on {obj.name!r} "
@@ -1348,6 +1884,9 @@ def prepare_materials_for_gltf(mesh_objects):
                     source,
                     channel,
                     resolution,
+                    source_active_uv_name,
+                    source_render_uv_name,
+                    bake_uv_name,
                 )
 
             base_image = baked["base_color"]
@@ -1398,6 +1937,14 @@ def prepare_materials_for_gltf(mesh_objects):
 
             tree = final_material.node_tree
             tree.nodes.clear()
+
+            bake_uv_node = tree.nodes.new(
+                "ShaderNodeUVMap"
+            )
+            bake_uv_node.name = "VCT Bake UV"
+            bake_uv_node.label = "VCT Bake UV"
+            bake_uv_node.uv_map = bake_uv_name
+            bake_uv_node.location = (-850, 0)
 
             output = tree.nodes.new("ShaderNodeOutputMaterial")
             output.location = (500, 0)
@@ -1514,6 +2061,33 @@ def prepare_materials_for_gltf(mesh_objects):
                         -700,
                     )
 
+            for texture_node in tree.nodes:
+                if texture_node.type != "TEX_IMAGE":
+                    continue
+
+                vector_socket = texture_node.inputs.get("Vector")
+
+                if vector_socket is None:
+                    raise RuntimeError(
+                        f"Final texture node {texture_node.name!r} "
+                        f"in material {final_material.name!r} "
+                        "has no Vector input."
+                    )
+
+                if vector_socket.is_linked:
+                    raise RuntimeError(
+                        f"Unexpected existing UV connection on final "
+                        f"texture node {texture_node.name!r} in "
+                        f"{final_material.name!r}."
+                    )
+
+                tree.links.new(
+                    bake_uv_node.outputs["UV"],
+                    vector_socket,
+                )
+
+                texture_node.extension = "EXTEND"
+
             blend_mode = _material_blend_mode(source)
 
             if has_alpha:
@@ -1620,6 +2194,83 @@ def validate_glb_model(output_path, expected_animation_count=None):
         for mesh in meshes
     ):
         raise RuntimeError("GLB contains no mesh primitives.")
+
+    materials = document.get("materials", [])
+    if not isinstance(materials, list):
+        raise RuntimeError("GLB material list is invalid.")
+    for mesh_index, mesh in enumerate(meshes):
+        for primitive_index, primitive in enumerate(
+            mesh.get("primitives", [])
+        ):
+            material_index = primitive.get("material")
+
+            if material_index is None:
+                continue
+
+            if (
+                not isinstance(material_index, int)
+                or material_index < 0
+                or material_index >= len(materials)
+            ):
+                raise RuntimeError(
+                    f"GLB mesh {mesh_index}, primitive "
+                    f"{primitive_index} references an invalid "
+                    f"material index: {material_index!r}."
+                )
+
+            attributes = primitive.get("attributes", {})
+
+            if not isinstance(attributes, dict):
+                raise RuntimeError(
+                    f"GLB mesh {mesh_index}, primitive "
+                    f"{primitive_index} has invalid attributes."
+                )
+
+            material = materials[material_index]
+            texture_infos = []
+
+            pbr = material.get("pbrMetallicRoughness", {})
+
+            if isinstance(pbr, dict):
+                for key in (
+                    "baseColorTexture",
+                    "metallicRoughnessTexture",
+                ):
+                    info = pbr.get(key)
+                    if isinstance(info, dict):
+                        texture_infos.append(info)
+
+            for key in (
+                "normalTexture",
+                "occlusionTexture",
+                "emissiveTexture",
+            ):
+                info = material.get(key)
+                if isinstance(info, dict):
+                    texture_infos.append(info)
+
+            for info in texture_infos:
+                tex_coord = info.get("texCoord", 0)
+
+                if (
+                    not isinstance(tex_coord, int)
+                    or tex_coord < 0
+                ):
+                    raise RuntimeError(
+                        f"GLB material {material_index} contains "
+                        f"invalid texCoord: {tex_coord!r}."
+                    )
+
+                attribute_name = f"TEXCOORD_{tex_coord}"
+
+                if attribute_name not in attributes:
+                    raise RuntimeError(
+                        f"GLB mesh {mesh_index}, primitive "
+                        f"{primitive_index}, material "
+                        f"{material_index} references "
+                        f"{attribute_name}, but the mesh does not "
+                        "contain that UV attribute."
+                    )
 
     binary_length, binary_type = struct.unpack_from(
         "<II", data, json_end
