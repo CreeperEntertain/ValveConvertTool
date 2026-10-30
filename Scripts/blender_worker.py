@@ -1781,351 +1781,100 @@ def _bake_source_material_channel(
 
 
 def prepare_materials_for_gltf(mesh_objects):
-    """
-    Bake SourceIO's evaluated material channels into textures and build
-    simple glTF-compatible Principled materials.
-    """
-    from array import array
-
     for obj in mesh_objects:
         if obj.type != "MESH":
             continue
 
-        (
-            source_active_uv_name,
-            source_render_uv_name,
-            bake_uv_name,
-            source_uv_areas,
-            bake_uv_areas,
-        ) = _prepare_bake_uv_layout(obj)
+        mesh = obj.data
+
+        if len(mesh.uv_layers) == 0:
+            has_textures = any(
+                slot.material is not None
+                and slot.material.node_tree is not None
+                and any(
+                    True
+                    for _ in _iter_material_image_nodes(
+                        slot.material.node_tree
+                    )
+                )
+                for slot in obj.material_slots
+            )
+
+            if has_textures:
+                raise RuntimeError(
+                    f"Cannot export textured mesh {obj.name!r}: "
+                    "SourceIO supplied no UV maps."
+                )
+
+            continue
+
+        source_active_layer = mesh.uv_layers.active
+        if source_active_layer is None:
+            source_active_layer = mesh.uv_layers[0]
+
+        source_render_layer = next(
+            (
+                layer
+                for layer in mesh.uv_layers
+                if layer.active_render
+            ),
+            source_active_layer,
+        )
+
+        source_active_uv_name = source_active_layer.name
+        source_render_uv_name = source_render_layer.name
 
         for slot_index, slot in enumerate(obj.material_slots):
             source = slot.material
-            if source is None:
+
+            if source is None or source.node_tree is None:
                 continue
-
-            source_nodes = list(
-                _walk_material_nodes(source.node_tree)
-            )
-
-            is_unlit = (
-                not any(
-                    node.type == "BSDF_PRINCIPLED"
-                    for node in source_nodes
-                )
-                and any(
-                    node.type == "EMISSION"
-                    for node in source_nodes
-                )
-            )
-
-            has_alpha = _material_uses_channel(
-                source, "alpha"
-            )
-
-            source_images = [
-                image
-                for _, image in _iter_material_image_nodes(
-                    source.node_tree
-                )
-            ]
-
-            (
-                resolution,
-                requested_resolution,
-                source_uv_area,
-                bake_uv_area,
-            ) = _choose_material_bake_resolution(
-                source_images,
-                slot_index,
-                source_uv_areas,
-                bake_uv_areas,
-            )
-
-            print(
-                f"[material] UV density estimate for {source.name!r}: "
-                f"source_area={source_uv_area:.6f}; "
-                f"bake_area={bake_uv_area:.6f}; "
-                f"requested={requested_resolution}; "
-                f"actual={resolution}",
-                flush=True,
-            )
-
-            print(
-                f"[material] Baking {source.name!r} on {obj.name!r} "
-                f"at {resolution}x{resolution}",
-                flush=True,
-            )
-
-            baked = {}
-
-            channels = [
-                "base_color",
-                "roughness",
-                "metallic",
-                "emission",
-                "normal",
-                "alpha",
-            ]
-
-            for channel in channels:
-                if channel == "alpha" and not has_alpha:
-                    continue
-
-                if (
-                    channel != "base_color"
-                    and not _material_uses_channel(source, channel)
-                ):
-                    continue
-
-                baked[channel] = _bake_source_material_channel(
-                    obj,
-                    slot_index,
-                    source,
-                    channel,
-                    resolution,
-                    source_active_uv_name,
-                    source_render_uv_name,
-                    bake_uv_name,
-                )
-
-            base_image = baked["base_color"]
-            alpha_image = baked.get("alpha")
-
-            if alpha_image is not None:
-                if (
-                    tuple(base_image.size)
-                    != tuple(alpha_image.size)
-                ):
-                    raise RuntimeError(
-                        f"Channel bake dimensions differ for "
-                        f"{source.name!r}."
-                    )
-
-                base_pixels = array(
-                    "f", [0.0]
-                ) * len(base_image.pixels)
-
-                alpha_pixels = array(
-                    "f", [0.0]
-                ) * len(alpha_image.pixels)
-
-                base_image.pixels.foreach_get(base_pixels)
-                alpha_image.pixels.foreach_get(alpha_pixels)
-
-                for index in range(0, len(base_pixels), 4):
-                    base_pixels[index + 3] = min(
-                        1.0,
-                        max(0.0, alpha_pixels[index]),
-                    )
-
-                base_image.pixels.foreach_set(base_pixels)
-                base_image.update()
-                base_image.pack()
-
-                bpy.data.images.remove(
-                    alpha_image, do_unlink=True
-                )
-
-            if hasattr(base_image, "alpha_mode"):
-                base_image.alpha_mode = "STRAIGHT"
 
             final_material = source.copy()
             final_material.name = f"{source.name}_glTF"
 
+            _clone_material_groups(final_material.node_tree)
+
+            uv_pin_counts = _pin_material_uv_sampling(
+                final_material.node_tree,
+                source_active_uv_name,
+                source_render_uv_name,
+            )
+
+            source_images = {}
+
+            for node, image in _iter_material_image_nodes(
+                final_material.node_tree
+            ):
+                node.extension = "REPEAT"
+
+                source_images[image.as_pointer()] = (
+                    image.name,
+                    int(image.size[0]),
+                    int(image.size[1]),
+                )
+
             slot.material = final_material
 
-            tree = final_material.node_tree
-            tree.nodes.clear()
-
-            bake_uv_node = tree.nodes.new(
-                "ShaderNodeUVMap"
+            image_summary = ", ".join(
+                f"{name} ({width}x{height})"
+                for name, width, height in sorted(
+                    source_images.values()
+                )
             )
-            bake_uv_node.name = "VCT Bake UV"
-            bake_uv_node.label = "VCT Bake UV"
-            bake_uv_node.uv_map = bake_uv_name
-            bake_uv_node.location = (-850, 0)
-
-            output = tree.nodes.new("ShaderNodeOutputMaterial")
-            output.location = (500, 0)
-
-            principled = tree.nodes.new(
-                "ShaderNodeBsdfPrincipled"
-            )
-            principled.inputs["Roughness"].default_value = 1.0
-            principled.location = (200, 0)
-
-            tree.links.new(
-                principled.outputs["BSDF"],
-                output.inputs["Surface"],
-            )
-
-            def connect_texture(image, socket_name, y):
-                if image is None:
-                    return None
-
-                texture = tree.nodes.new("ShaderNodeTexImage")
-                texture.image = image
-                texture.label = image.name
-                texture.location = (-500, y)
-
-                socket = principled.inputs.get(socket_name)
-                if socket is not None:
-                    tree.links.new(
-                        texture.outputs["Color"], socket
-                    )
-
-                return texture
-
-            if is_unlit:
-                principled.inputs["Base Color"].default_value = (
-                    0.0, 0.0, 0.0, 1.0
-                )
-            else:
-                connect_texture(
-                    base_image, "Base Color", 200
-                )
-
-            if has_alpha:
-                base_texture = next(
-                    (
-                        node for node in tree.nodes
-                        if node.type == "TEX_IMAGE"
-                        and node.image == base_image
-                    ),
-                    None,
-                )
-
-                if base_texture is None:
-                    base_texture = tree.nodes.new(
-                        "ShaderNodeTexImage"
-                    )
-                    base_texture.image = base_image
-                    base_texture.location = (-500, 400)
-
-                alpha_socket = principled.inputs.get("Alpha")
-                if alpha_socket is not None:
-                    tree.links.new(
-                        base_texture.outputs["Alpha"],
-                        alpha_socket,
-                    )
-
-            roughness_image = baked.get("roughness")
-            if roughness_image is not None:
-                roughness_image.colorspace_settings.name = "Non-Color"
-                connect_texture(
-                    roughness_image, "Roughness", -100
-                )
-
-            metallic_image = baked.get("metallic")
-            if metallic_image is not None:
-                metallic_image.colorspace_settings.name = "Non-Color"
-                connect_texture(
-                    metallic_image, "Metallic", -300
-                )
-
-            normal_image = baked.get("normal")
-            if normal_image is not None:
-                normal_image.colorspace_settings.name = "Non-Color"
-
-                normal_texture = tree.nodes.new(
-                    "ShaderNodeTexImage"
-                )
-                normal_texture.image = normal_image
-                normal_texture.location = (-500, -500)
-
-                normal_map = tree.nodes.new(
-                    "ShaderNodeNormalMap"
-                )
-                normal_map.location = (-150, -500)
-
-                tree.links.new(
-                    normal_texture.outputs["Color"],
-                    normal_map.inputs["Color"],
-                )
-                tree.links.new(
-                    normal_map.outputs["Normal"],
-                    principled.inputs["Normal"],
-                )
-
-            emission_image = baked.get("emission")
-            if emission_image is not None:
-                emission_socket = (
-                    principled.inputs.get("Emission Color")
-                    or principled.inputs.get("Emission")
-                )
-                if emission_socket is not None:
-                    connect_texture(
-                        emission_image,
-                        emission_socket.name,
-                        -700,
-                    )
-
-            for texture_node in tree.nodes:
-                if texture_node.type != "TEX_IMAGE":
-                    continue
-
-                vector_socket = texture_node.inputs.get("Vector")
-
-                if vector_socket is None:
-                    raise RuntimeError(
-                        f"Final texture node {texture_node.name!r} "
-                        f"in material {final_material.name!r} "
-                        "has no Vector input."
-                    )
-
-                if vector_socket.is_linked:
-                    raise RuntimeError(
-                        f"Unexpected existing UV connection on final "
-                        f"texture node {texture_node.name!r} in "
-                        f"{final_material.name!r}."
-                    )
-
-                tree.links.new(
-                    bake_uv_node.outputs["UV"],
-                    vector_socket,
-                )
-
-                texture_node.extension = "EXTEND"
-
-            blend_mode = _material_blend_mode(source)
-
-            if has_alpha:
-                if blend_mode == "OPAQUE":
-                    blend_mode = "BLEND"
-
-                if blend_mode == "BLEND":
-                    if hasattr(final_material, "blend_method"):
-                        final_material.blend_method = "BLEND"
-                    if hasattr(
-                        final_material, "surface_render_method"
-                    ):
-                        final_material.surface_render_method = "BLENDED"
-
-                elif blend_mode == "MASK":
-                    if hasattr(final_material, "blend_method"):
-                        final_material.blend_method = "CLIP"
-                    if hasattr(
-                        final_material, "surface_render_method"
-                    ):
-                        final_material.surface_render_method = "DITHERED"
-
-                    if hasattr(final_material, "alpha_threshold"):
-                        final_material.alpha_threshold = (
-                            getattr(source, "alpha_threshold", 0.5)
-                        )
-
-            else:
-                if hasattr(final_material, "blend_method"):
-                    final_material.blend_method = "OPAQUE"
-                if hasattr(
-                    final_material, "surface_render_method"
-                ):
-                    final_material.surface_render_method = "DITHERED"
 
             print(
-                f"[material] Finished {source.name!r}: "
-                f"{', '.join(sorted(baked))}",
+                f"[material] Native texture export "
+                f"{source.name!r} on {obj.name!r}: "
+                f"uv_active={source_active_uv_name!r}; "
+                f"uv_render={source_render_uv_name!r}; "
+                f"images={image_summary or 'none'}; "
+                f"pinned_image_inputs="
+                f"{uv_pin_counts['image_inputs']}; "
+                f"pinned_uv_map_nodes="
+                f"{uv_pin_counts['uv_map_nodes']}; "
+                f"pinned_texture_coordinate_nodes="
+                f"{uv_pin_counts['texture_coordinate_nodes']}",
                 flush=True,
             )
 
