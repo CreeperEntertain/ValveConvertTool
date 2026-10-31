@@ -1189,10 +1189,73 @@ def _find_sourceio_opacity_input(tree):
 
     result = search(tree)
 
-    if result is None:
+    if result is not None:
+        return result
+
+    def find_texture_alpha(current_tree, visited=None):
+        if visited is None:
+            visited = set()
+
+        pointer = current_tree.as_pointer()
+        if pointer in visited:
+            return []
+        visited.add(pointer)
+
+        found = []
+
+        for node in current_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is not None:
+                alpha_output = node.outputs.get("Alpha")
+
+                if alpha_output is not None:
+                    identity = " ".join((
+                        str(node.name or ""),
+                        str(node.label or ""),
+                        str(node.image.name or ""),
+                    )).casefold()
+
+                    found.append((
+                        current_tree,
+                        alpha_output,
+                        "basetexture" in identity,
+                        node.name,
+                    ))
+
+            elif node.type == "GROUP" and node.node_tree is not None:
+                found.extend(
+                    find_texture_alpha(node.node_tree, visited)
+                )
+
+        return found
+
+    textures = find_texture_alpha(tree)
+    named = [item for item in textures if item[2]]
+
+    if len(named) == 1:
+        owner_tree, alpha_output, _, node_name = named[0]
+    elif len(named) > 1:
+        raise RuntimeError(
+            "Multiple possible $basetexture alpha sources: "
+            + ", ".join(item[3] for item in named)
+        )
+    elif len(textures) == 1:
+        owner_tree, alpha_output, _, node_name = textures[0]
+    elif len(textures) > 1:
+        raise RuntimeError(
+            "No shader opacity input found and multiple texture "
+            "alpha sources are possible: "
+            + ", ".join(item[3] for item in textures)
+        )
+    else:
         return None, None, False
 
-    return result
+    print(
+        f"[material] Alpha probe fallback: using image alpha from "
+        f"{node_name!r} in {owner_tree.name!r}.",
+        flush=True,
+    )
+
+    return owner_tree, alpha_output, False
 
 
 def _unique_opacity_candidate(candidates, tree):
