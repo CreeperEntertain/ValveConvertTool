@@ -346,9 +346,15 @@ def _source_material_alpha_policy(material):
             return False
 
         if isinstance(value, str):
-            return value.strip().casefold() in {
-                "1", "true", "yes", "on"
-            }
+            text = value.strip().casefold()
+
+            if text in {"true", "yes", "on"}:
+                return True
+
+            if text in {"false", "no", "off", ""}:
+                return False
+
+            return _finite_number(text, 0.0) != 0.0
 
         return _finite_number(value, 0.0) != 0.0
 
@@ -396,6 +402,7 @@ def _source_material_alpha_policy(material):
         )
 
     use_texture_alpha = translucent or alpha_test or additive
+    alpha_test = alpha_test and not (translucent or additive)
 
     return (
         use_texture_alpha,
@@ -1063,6 +1070,225 @@ def _replace_shader_leaves_with_channel_emission(
     return converted
 
 
+def _shader_branch_has_transparency(shader_input, visited=None):
+    if not shader_input.is_linked:
+        return False
+
+    if visited is None:
+        visited = set()
+
+    for link in shader_input.links:
+        node = link.from_node
+
+        if node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}:
+            return True
+
+        pointer = node.as_pointer()
+        if pointer in visited:
+            continue
+        visited.add(pointer)
+
+        if node.type == "GROUP" and node.node_tree is not None:
+            if any(
+                child.type in {"BSDF_TRANSPARENT", "HOLDOUT"}
+                for child in _walk_material_nodes(node.node_tree)
+            ):
+                return True
+
+        for socket in node.inputs:
+            if (
+                socket.type == "SHADER"
+                and _shader_branch_has_transparency(socket, visited)
+            ):
+                return True
+
+    return False
+
+
+def _find_sourceio_opacity_input(tree):
+    candidates = []
+
+    for node in tree.nodes:
+        if node.type != "GROUP":
+            continue
+
+        identity = (
+            f"{node.name} {node.label} "
+            f"{node.node_tree.name if node.node_tree else ''}"
+        ).casefold()
+
+        if "alphatest" not in identity:
+            continue
+
+        for socket in node.inputs:
+            socket_name = socket.name.casefold()
+
+            if (
+                "alpha" in socket_name
+                and (
+                    "basemap" in socket_name
+                    or socket_name.strip() == "alpha"
+                )
+            ):
+                candidates.append((socket, False))
+
+    if candidates:
+        return _unique_opacity_candidate(candidates, tree)
+
+    candidates = []
+
+    for node in tree.nodes:
+        if node.type == "BSDF_PRINCIPLED":
+            socket = node.inputs.get("Alpha")
+            if socket is not None and (
+                socket.is_linked
+                or _finite_number(socket.default_value, 1.0) < 0.99999
+            ):
+                candidates.append((socket, False))
+
+        elif node.type == "MIX_SHADER":
+            factor = node.inputs.get("Fac")
+            if factor is None:
+                continue
+
+            transparent_first = _shader_branch_has_transparency(
+                node.inputs[1]
+            )
+            transparent_second = _shader_branch_has_transparency(
+                node.inputs[2]
+            )
+
+            if transparent_first != transparent_second:
+                candidates.append((factor, transparent_second))
+
+    if candidates:
+        return _unique_opacity_candidate(candidates, tree)
+
+    return None, False
+
+
+def _unique_opacity_candidate(candidates, tree):
+    unique = {}
+
+    for socket, invert in candidates:
+        if socket.is_linked:
+            link = socket.links[0]
+            source = link.from_socket
+            key = (
+                source.node.as_pointer(),
+                source.identifier,
+                bool(invert),
+            )
+        else:
+            key = (
+                socket.node.as_pointer(),
+                socket.identifier,
+                bool(invert),
+            )
+
+        unique[key] = (socket, invert)
+
+    if len(unique) != 1:
+        raise RuntimeError(
+            "Ambiguous SourceIO opacity inputs: "
+            + ", ".join(
+                f"{socket.node.name}.{socket.name}"
+                for socket, _ in unique.values()
+            )
+        )
+
+    return next(iter(unique.values()))
+
+
+def _replace_shader_graph_with_alpha_probe(tree):
+    opacity_input, invert = _find_sourceio_opacity_input(tree)
+
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.name = "VCT Opacity Value Probe"
+    emission.label = "VCT: actual opacity value"
+    emission.inputs["Strength"].default_value = 1.0
+
+    scalar = None
+
+    if opacity_input is None:
+        emission.inputs["Color"].default_value = (1, 1, 1, 1)
+
+    elif not opacity_input.is_linked:
+        value = _finite_number(
+            opacity_input.default_value,
+            1.0,
+        )
+        if invert:
+            value = 1.0 - value
+
+        emission.inputs["Color"].default_value = (
+            value, value, value, 1.0
+        )
+
+    else:
+        source = opacity_input.links[0].from_socket
+
+        if source.type == "VALUE":
+            scalar = source
+
+        elif source.type == "RGBA":
+            to_bw = tree.nodes.new("ShaderNodeRGBToBW")
+            tree.links.new(source, to_bw.inputs["Color"])
+            scalar = to_bw.outputs["Val"]
+
+        else:
+            raise RuntimeError(
+                "Unsupported SourceIO opacity socket type "
+                f"{source.type!r} from {source.node.name!r}."
+            )
+
+        if invert:
+            inverse = tree.nodes.new("ShaderNodeMath")
+            inverse.operation = "SUBTRACT"
+            inverse.inputs[0].default_value = 1.0
+            tree.links.new(scalar, inverse.inputs[1])
+            scalar = inverse.outputs[0]
+
+        combine = tree.nodes.new("ShaderNodeCombineColor")
+        combine.mode = "RGB"
+
+        for component in ("Red", "Green", "Blue"):
+            tree.links.new(
+                scalar,
+                combine.inputs[component],
+            )
+
+        tree.links.new(
+            combine.outputs["Color"],
+            emission.inputs["Color"],
+        )
+
+    outputs = [
+        node
+        for node in tree.nodes
+        if node.type == "OUTPUT_MATERIAL"
+        and getattr(node, "target", "ALL") in {"ALL", "EEVEE"}
+    ]
+
+    if not outputs:
+        outputs = [
+            tree.nodes.new("ShaderNodeOutputMaterial")
+        ]
+
+    for output in outputs:
+        surface = output.inputs.get("Surface")
+        if surface is None:
+            continue
+
+        for link in list(surface.links):
+            tree.links.remove(link)
+
+        tree.links.new(
+            emission.outputs["Emission"],
+            surface,
+        )
+
+
 def _render_sourceio_channel(
     source_material,
     channel,
@@ -1094,10 +1320,9 @@ def _render_sourceio_channel(
             node.extension = "REPEAT"
 
         if alpha_pass:
-            if hasattr(material, "blend_method"):
-                material.blend_method = "BLEND"
-            if hasattr(material, "surface_render_method"):
-                material.surface_render_method = "BLENDED"
+            _replace_shader_graph_with_alpha_probe(
+                material.node_tree
+            )
 
         else:
             _bypass_transparency_for_color(material.node_tree)
@@ -1326,13 +1551,13 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
     count = color_image.size[0] * color_image.size[1]
 
     color = np.empty(count * 4, dtype=np.float32)
-    alpha = np.empty(count * 4, dtype=np.float32)
+    probe = np.empty(count * 4, dtype=np.float32)
 
     color_image.pixels.foreach_get(color)
-    alpha_image.pixels.foreach_get(alpha)
+    alpha_image.pixels.foreach_get(probe)
 
     color[3::4] = np.clip(
-        alpha[3::4] * factor,
+        probe[0::4] * factor,
         0.0,
         1.0,
     )
