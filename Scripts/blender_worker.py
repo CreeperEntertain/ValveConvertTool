@@ -656,8 +656,6 @@ def _bypass_transparency_for_color(node_tree):
 
         other_index = 1 - transparent_index
         other_link = linked[other_index]
-
-        # Only bypass the blend when its other shader branch is connected.
         if other_link is None:
             continue
 
