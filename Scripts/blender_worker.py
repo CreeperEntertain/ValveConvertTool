@@ -1780,15 +1780,509 @@ def _bake_source_material_channel(
                 bpy.data.node_groups.remove(group)
 
 
+def _connect_probe_input(tree, source_socket, target_socket):
+    if source_socket is None:
+        return
+
+    if source_socket.is_linked:
+        if source_socket.type == "VALUE":
+            combine = tree.nodes.new("ShaderNodeCombineColor")
+            for name in ("Red", "Green", "Blue"):
+                for link in list(source_socket.links):
+                    tree.links.new(link.from_socket, combine.inputs[name])
+            tree.links.new(combine.outputs["Color"], target_socket)
+        else:
+            for link in list(source_socket.links):
+                tree.links.new(link.from_socket, target_socket)
+        return
+
+    value = getattr(source_socket, "default_value", None)
+    if value is None:
+        return
+
+    if source_socket.type == "VALUE":
+        value = float(value)
+        target_socket.default_value = (value, value, value, 1.0)
+    else:
+        target_socket.default_value = value
+
+
+def _replace_shader_leaves_with_channel_emission(
+    tree,
+    channel,
+    visited=None,
+):
+    """Keep upstream paths intact; replace surface leaves with channel probes."""
+    if tree is None:
+        return 0
+
+    if visited is None:
+        visited = set()
+
+    pointer = tree.as_pointer()
+    if pointer in visited:
+        return 0
+    visited.add(pointer)
+
+    converted = 0
+
+    for node in list(tree.nodes):
+        if node.type == "GROUP" and node.node_tree is not None:
+            converted += _replace_shader_leaves_with_channel_emission(
+                node.node_tree,
+                channel,
+                visited,
+            )
+
+    shader_types = {
+        "BSDF_PRINCIPLED",
+        "EMISSION",
+        "BSDF_DIFFUSE",
+        "BSDF_GLOSSY",
+        "BSDF_ANISOTROPIC",
+        "BSDF_TRANSLUCENT",
+        "BSDF_GLASS",
+        "BSDF_REFRACTION",
+        "BSDF_TOON",
+        "BSDF_VELVET",
+    }
+
+    for node in list(tree.nodes):
+        if node.type not in shader_types:
+            continue
+
+        output = next(
+            (
+                socket
+                for socket in node.outputs
+                if socket.type == "SHADER" and socket.is_linked
+            ),
+            None,
+        )
+        if output is None:
+            continue
+
+        destinations = [
+            link.to_socket
+            for link in list(output.links)
+        ]
+
+        probe = tree.nodes.new("ShaderNodeEmission")
+        probe.location = node.location
+        probe.label = f"VCT {channel} probe"
+
+        color = probe.inputs["Color"]
+
+        if channel == "base_color":
+            source = (
+                node.inputs.get("Color")
+                if node.type == "EMISSION"
+                else (
+                    node.inputs.get("Base Color")
+                    or node.inputs.get("Color")
+                )
+            )
+            _connect_probe_input(tree, source, color)
+
+        elif channel == "emission":
+            source = (
+                node.inputs.get("Color")
+                if node.type == "EMISSION"
+                else (
+                    node.inputs.get("Emission Color")
+                    or node.inputs.get("Emission")
+                )
+            )
+
+            strength = (
+                node.inputs.get("Strength")
+                if node.type == "EMISSION"
+                else node.inputs.get("Emission Strength")
+            )
+
+            _connect_probe_input(tree, source, color)
+
+            if strength is None:
+                probe.inputs["Strength"].default_value = 0.0
+            elif strength.is_linked:
+                for link in list(strength.links):
+                    tree.links.new(
+                        link.from_socket,
+                        probe.inputs["Strength"],
+                    )
+            else:
+                probe.inputs["Strength"].default_value = float(
+                    strength.default_value
+                )
+
+        elif channel in {"roughness", "metallic"}:
+            source = node.inputs.get(
+                "Roughness" if channel == "roughness" else "Metallic"
+            )
+            default = 0.5 if channel == "roughness" else 0.0
+
+            if source is None:
+                color.default_value = (
+                    default,
+                    default,
+                    default,
+                    1.0,
+                )
+            else:
+                _connect_probe_input(tree, source, color)
+
+        for destination in destinations:
+            tree.links.new(
+                probe.outputs["Emission"],
+                destination,
+            )
+
+        tree.nodes.remove(node)
+        converted += 1
+
+    return converted
+
+
+def _render_sourceio_channel(
+    source_material,
+    channel,
+    uv_names,
+    active_uv,
+    render_uv,
+    width,
+    height,
+    alpha_pass=False,
+):
+    """
+    Render the connected material graph on a temporary normalized UV quad.
+    """
+    material = source_material.copy()
+    material.name = f"{source_material.name}_VCT_{channel}"
+
+    groups = _clone_material_groups(material.node_tree)
+    scene = None
+    image = None
+
+    try:
+        _pin_material_uv_sampling(
+            material.node_tree,
+            active_uv,
+            render_uv,
+        )
+
+        for node, _ in _iter_material_image_nodes(material.node_tree):
+            node.extension = "REPEAT"
+
+        if alpha_pass:
+            if hasattr(material, "blend_method"):
+                material.blend_method = "BLEND"
+            if hasattr(material, "surface_render_method"):
+                material.surface_render_method = "BLENDED"
+
+        else:
+            _bypass_transparency_for_color(material.node_tree)
+
+            if not _replace_shader_leaves_with_channel_emission(
+                material.node_tree,
+                channel,
+            ):
+                raise RuntimeError(
+                    f"No connected shader output for {channel!r}."
+                )
+
+        aspect = width / height
+
+        scene = bpy.data.scenes.new(f"VCT_{channel}_Scene")
+        available_engines = {
+            item.identifier
+            for item in scene.render.bl_rna.properties["engine"].enum_items
+        }
+
+        render_engine = next(
+            (
+                engine
+                for engine in (
+                    "BLENDER_EEVEE_NEXT",
+                    "BLENDER_EEVEE",
+                    "CYCLES",
+                )
+                if engine in available_engines
+            ),
+            None,
+        )
+
+        if render_engine is None:
+            raise RuntimeError(
+                "No supported material-compositing render engine is available. "
+                f"Available engines: {sorted(available_engines)}"
+            )
+
+        scene.render.engine = render_engine
+        scene.render.resolution_x = width
+        scene.render.resolution_y = height
+        scene.render.resolution_percentage = 100
+        scene.render.film_transparent = True
+
+        scene.render.image_settings.file_format = "PNG"
+        scene.render.image_settings.color_mode = "RGBA"
+        scene.render.image_settings.color_depth = "16"
+        scene.render.image_settings.compression = 0
+        scene.render.use_file_extension = False
+
+        scene.view_settings.view_transform = (
+            "Standard"
+            if channel in {"base_color", "emission"}
+            else "Raw"
+        )
+
+        try:
+            scene.view_settings.look = "None"
+        except (AttributeError, TypeError):
+            pass
+
+        camera_data = bpy.data.cameras.new(
+            f"VCT_{channel}_CameraData"
+        )
+        camera_data.type = "ORTHO"
+        camera_data.ortho_scale = aspect
+        camera_data.clip_start = 0.01
+        camera_data.clip_end = 100.0
+
+        camera = bpy.data.objects.new(
+            f"VCT_{channel}_Camera",
+            camera_data,
+        )
+        camera.location = (aspect * 0.5, 0.5, 2.0)
+        scene.collection.objects.link(camera)
+        scene.camera = camera
+
+        mesh = bpy.data.meshes.new(f"VCT_{channel}_QuadMesh")
+        mesh.from_pydata(
+            [
+                (0, 0, 0),
+                (aspect, 0, 0),
+                (aspect, 1, 0),
+                (0, 1, 0),
+            ],
+            [],
+            [(0, 1, 2, 3)],
+        )
+
+        uv_values = (
+            (0, 0),
+            (1, 0),
+            (1, 1),
+            (0, 1),
+        )
+
+        for name in uv_names:
+            layer = mesh.uv_layers.new(name=name)
+
+            for loop_index, loop in enumerate(mesh.loops):
+                layer.data[loop_index].uv = uv_values[
+                    loop.vertex_index
+                ]
+
+            if name == active_uv:
+                mesh.uv_layers.active_index = len(mesh.uv_layers) - 1
+
+        plane = bpy.data.objects.new(
+            f"VCT_{channel}_Quad",
+            mesh,
+        )
+        scene.collection.objects.link(plane)
+        plane.data.materials.append(material)
+
+        with tempfile.TemporaryDirectory(
+            prefix="vct_graph_render_"
+        ) as temp_dir:
+            filepath = os.path.join(temp_dir, f"{channel}.png")
+            scene.render.filepath = filepath
+
+            result = bpy.ops.render.render(
+                write_still=True,
+                scene=scene.name,
+            )
+
+            if "CANCELLED" in result or not os.path.isfile(filepath):
+                raise RuntimeError(
+                    "Eevee did not write the composite."
+                )
+
+            image = bpy.data.images.load(
+                filepath,
+                check_existing=False,
+            )
+            image.name = (
+                f"{source_material.name}_{channel}_composite"
+            )
+            image.alpha_mode = "STRAIGHT"
+
+            image.colorspace_settings.name = (
+                "sRGB"
+                if channel in {"base_color", "emission"}
+                else "Non-Color"
+            )
+            image.pack()
+
+        return image
+
+    except Exception as exc:
+        if image is not None:
+            bpy.data.images.remove(image, do_unlink=True)
+
+        raise RuntimeError(
+            f"Node-path evaluation failed for "
+            f"{source_material.name!r} ({channel}): "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    finally:
+        if scene is not None:
+            for obj in list(scene.objects):
+                datablock = obj.data
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+                if datablock is not None and datablock.users == 0:
+                    if isinstance(datablock, bpy.types.Mesh):
+                        bpy.data.meshes.remove(datablock)
+                    elif isinstance(datablock, bpy.types.Camera):
+                        bpy.data.cameras.remove(datablock)
+
+            bpy.data.scenes.remove(scene)
+
+        if material.name in bpy.data.materials:
+            bpy.data.materials.remove(material, do_unlink=True)
+
+        for group in reversed(groups):
+            if group.users == 0:
+                bpy.data.node_groups.remove(group)
+
+
+def _repack_modified_image(image):
+    """Pack the current image buffer, independent of its original filepath."""
+    original_filepath = image.filepath_raw
+    original_format = image.file_format
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="vct_image_pack_"
+        ) as temp_dir:
+            filepath = os.path.join(
+                temp_dir,
+                "composite.png",
+            )
+
+            image.filepath_raw = filepath
+            image.file_format = "PNG"
+            image.save()
+
+            with open(filepath, "rb") as file:
+                encoded_data = file.read()
+
+            if not encoded_data:
+                raise RuntimeError(
+                    f"Image encoding produced an empty file: {image.name!r}"
+                )
+
+            image.pack(
+                data=encoded_data,
+                data_len=len(encoded_data),
+            )
+
+    finally:
+        image.filepath_raw = original_filepath
+        image.file_format = original_format
+
+
+def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
+    import numpy as np
+
+    if tuple(color_image.size) != tuple(alpha_image.size):
+        raise RuntimeError(
+            "Composite color/alpha dimensions do not match."
+        )
+
+    count = color_image.size[0] * color_image.size[1]
+
+    color = np.empty(count * 4, dtype=np.float32)
+    alpha = np.empty(count * 4, dtype=np.float32)
+
+    color_image.pixels.foreach_get(color)
+    alpha_image.pixels.foreach_get(alpha)
+
+    color[3::4] = np.clip(
+        alpha[3::4] * factor,
+        0.0,
+        1.0,
+    )
+
+    color_image.pixels.foreach_set(color)
+    color_image.alpha_mode = "STRAIGHT"
+    color_image.update()
+
+    _repack_modified_image(color_image)
+
+
+def _preserve_sourceio_normal_map(
+    source,
+    tree,
+    principled,
+    uv_name,
+):
+    """Keep SourceIO's direct image -> NormalMap path in tangent space."""
+    source_bsdf = next(
+        (
+            node
+            for node in _walk_material_nodes(source.node_tree)
+            if node.type == "BSDF_PRINCIPLED"
+            and node.inputs.get("Normal") is not None
+            and node.inputs["Normal"].is_linked
+        ),
+        None,
+    )
+
+    if source_bsdf is None:
+        return
+
+    normal_map = source_bsdf.inputs["Normal"].links[0].from_node
+
+    if normal_map.type != "NORMAL_MAP":
+        return
+
+    color_input = normal_map.inputs.get("Color")
+    if color_input is None or not color_input.is_linked:
+        return
+
+    image_node = color_input.links[0].from_node
+    if image_node.type != "TEX_IMAGE" or image_node.image is None:
+        return
+
+    uv = tree.nodes.new("ShaderNodeUVMap")
+    uv.uv_map = uv_name
+
+    texture = tree.nodes.new("ShaderNodeTexImage")
+    texture.image = image_node.image
+    texture.extension = "REPEAT"
+
+    normal = tree.nodes.new("ShaderNodeNormalMap")
+    normal.space = normal_map.space
+
+    tree.links.new(uv.outputs["UV"], texture.inputs["Vector"])
+    tree.links.new(texture.outputs["Color"], normal.inputs["Color"])
+    tree.links.new(normal.outputs["Normal"], principled.inputs["Normal"])
+
+
 def prepare_materials_for_gltf(mesh_objects):
+    """Flatten connected SourceIO channel paths without Cycles or UV atlasing."""
     for obj in mesh_objects:
         if obj.type != "MESH":
             continue
 
         mesh = obj.data
 
-        if len(mesh.uv_layers) == 0:
-            has_textures = any(
+        if not mesh.uv_layers:
+            if any(
                 slot.material is not None
                 and slot.material.node_tree is not None
                 and any(
@@ -1798,96 +2292,312 @@ def prepare_materials_for_gltf(mesh_objects):
                     )
                 )
                 for slot in obj.material_slots
-            )
-
-            if has_textures:
+            ):
                 raise RuntimeError(
-                    f"Cannot export textured mesh {obj.name!r}: "
-                    "SourceIO supplied no UV maps."
+                    f"Textured mesh {obj.name!r} has no SourceIO UV map."
                 )
-
             continue
 
-        source_active_layer = mesh.uv_layers.active
-        if source_active_layer is None:
-            source_active_layer = mesh.uv_layers[0]
-
-        source_render_layer = next(
+        active_layer = mesh.uv_layers.active or mesh.uv_layers[0]
+        render_layer = next(
             (
                 layer
                 for layer in mesh.uv_layers
                 if layer.active_render
             ),
-            source_active_layer,
+            active_layer,
         )
 
-        source_active_uv_name = source_active_layer.name
-        source_render_uv_name = source_render_layer.name
+        active_uv = active_layer.name
+        render_uv = render_layer.name
+        uv_names = [layer.name for layer in mesh.uv_layers]
 
-        for slot_index, slot in enumerate(obj.material_slots):
+        for slot in obj.material_slots:
             source = slot.material
 
             if source is None or source.node_tree is None:
                 continue
 
-            final_material = source.copy()
-            final_material.name = f"{source.name}_glTF"
+            nodes = list(_walk_material_nodes(source.node_tree))
 
-            _clone_material_groups(final_material.node_tree)
-
-            uv_pin_counts = _pin_material_uv_sampling(
-                final_material.node_tree,
-                source_active_uv_name,
-                source_render_uv_name,
+            uses_multiple_uvs = (
+                active_uv != render_uv
+                and any(
+                    node.type == "TEX_COORD"
+                    and node.outputs.get("UV") is not None
+                    and node.outputs["UV"].is_linked
+                    for node in nodes
+                )
+            ) or any(
+                node.type == "UVMAP"
+                and node.uv_map
+                and node.uv_map != active_uv
+                for node in nodes
             )
 
-            source_images = {}
+            if uses_multiple_uvs:
+                print(
+                    f"[material] Keeping {source.name!r} native on "
+                    f"{obj.name!r}: graph samples another UV domain.",
+                    flush=True,
+                )
+                continue
 
-            for node, image in _iter_material_image_nodes(
-                final_material.node_tree
+            images = [
+                image
+                for _, image in _iter_material_image_nodes(
+                    source.node_tree
+                )
+            ]
+
+            width = max(
+                [512] + [int(image.size[0]) for image in images]
+            )
+            height = max(
+                [512] + [int(image.size[1]) for image in images]
+            )
+
+            is_unlit = (
+                not any(
+                    node.type == "BSDF_PRINCIPLED"
+                    for node in nodes
+                )
+                and any(
+                    node.type == "EMISSION"
+                    for node in nodes
+                )
+            )
+
+            (
+                use_alpha,
+                vertex_alpha,
+                alpha_factor,
+                alpha_test,
+                cutoff,
+            ) = _source_material_alpha_policy(source)
+
+            if vertex_alpha:
+                print(
+                    f"[material] Keeping {source.name!r} native on "
+                    f"{obj.name!r}: $vertexalpha is mesh-dependent.",
+                    flush=True,
+                )
+                continue
+
+            has_alpha = (
+                _material_uses_channel(source, "alpha")
+                or use_alpha
+                or alpha_factor < 0.99999
+                or any(
+                    node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}
+                    for node in nodes
+                )
+            )
+
+            base_image = _render_sourceio_channel(
+                source,
+                "base_color",
+                uv_names,
+                active_uv,
+                render_uv,
+                width,
+                height,
+            )
+
+            if has_alpha:
+                alpha_image = _render_sourceio_channel(
+                    source,
+                    "alpha",
+                    uv_names,
+                    active_uv,
+                    render_uv,
+                    width,
+                    height,
+                    alpha_pass=True,
+                )
+
+                try:
+                    _merge_rendered_alpha(
+                        base_image,
+                        alpha_image,
+                        alpha_factor,
+                    )
+                finally:
+                    bpy.data.images.remove(
+                        alpha_image,
+                        do_unlink=True,
+                    )
+
+            emission_image = None
+            if (
+                not is_unlit
+                and _material_uses_channel(source, "emission")
             ):
-                node.extension = "REPEAT"
-
-                source_images[image.as_pointer()] = (
-                    image.name,
-                    int(image.size[0]),
-                    int(image.size[1]),
+                emission_image = _render_sourceio_channel(
+                    source,
+                    "emission",
+                    uv_names,
+                    active_uv,
+                    render_uv,
+                    width,
+                    height,
                 )
 
-            slot.material = final_material
-
-            image_summary = ", ".join(
-                f"{name} ({width}x{height})"
-                for name, width, height in sorted(
-                    source_images.values()
+            roughness_image = None
+            if _material_uses_channel(source, "roughness"):
+                roughness_image = _render_sourceio_channel(
+                    source,
+                    "roughness",
+                    uv_names,
+                    active_uv,
+                    render_uv,
+                    width,
+                    height,
                 )
+
+            metallic_image = None
+            if _material_uses_channel(source, "metallic"):
+                metallic_image = _render_sourceio_channel(
+                    source,
+                    "metallic",
+                    uv_names,
+                    active_uv,
+                    render_uv,
+                    width,
+                    height,
+                )
+
+            final = source.copy()
+            final.name = f"{source.name}_glTF"
+
+            tree = final.node_tree
+            tree.nodes.clear()
+
+            output = tree.nodes.new("ShaderNodeOutputMaterial")
+            bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+
+            tree.links.new(
+                bsdf.outputs["BSDF"],
+                output.inputs["Surface"],
             )
+
+            uv_node = tree.nodes.new("ShaderNodeUVMap")
+            uv_node.name = "VCT Composite UV"
+            uv_node.uv_map = active_uv
+
+            def add_texture(image, socket_name, y):
+                texture = tree.nodes.new("ShaderNodeTexImage")
+                texture.image = image
+                texture.extension = "REPEAT"
+                texture.location = (-450, y)
+
+                tree.links.new(
+                    uv_node.outputs["UV"],
+                    texture.inputs["Vector"],
+                )
+
+                socket = bsdf.inputs.get(socket_name)
+                if socket is not None:
+                    tree.links.new(
+                        texture.outputs["Color"],
+                        socket,
+                    )
+
+                return texture
+
+            base_texture = add_texture(
+                base_image,
+                "Base Color",
+                200,
+            )
+
+            if has_alpha:
+                alpha_socket = bsdf.inputs.get("Alpha")
+                if alpha_socket is not None:
+                    tree.links.new(
+                        base_texture.outputs["Alpha"],
+                        alpha_socket,
+                    )
+
+            if roughness_image is not None:
+                add_texture(
+                    roughness_image,
+                    "Roughness",
+                    -100,
+                )
+
+            if metallic_image is not None:
+                add_texture(
+                    metallic_image,
+                    "Metallic",
+                    -300,
+                )
+
+            if emission_image is not None:
+                emission_socket = (
+                    bsdf.inputs.get("Emission Color")
+                    or bsdf.inputs.get("Emission")
+                )
+
+                if emission_socket is not None:
+                    add_texture(
+                        emission_image,
+                        emission_socket.name,
+                        -500,
+                    )
+
+                strength = bsdf.inputs.get("Emission Strength")
+                if strength is not None:
+                    strength.default_value = 1.0
+
+            _preserve_sourceio_normal_map(
+                source,
+                tree,
+                bsdf,
+                active_uv,
+            )
+
+            if has_alpha:
+                if alpha_test:
+                    if hasattr(final, "blend_method"):
+                        final.blend_method = "CLIP"
+                    if hasattr(final, "surface_render_method"):
+                        final.surface_render_method = "DITHERED"
+                    if hasattr(final, "alpha_threshold"):
+                        final.alpha_threshold = cutoff
+                else:
+                    if hasattr(final, "blend_method"):
+                        final.blend_method = "BLEND"
+                    if hasattr(final, "surface_render_method"):
+                        final.surface_render_method = "BLENDED"
+
+            slot.material = final
 
             print(
-                f"[material] Native texture export "
-                f"{source.name!r} on {obj.name!r}: "
-                f"uv_active={source_active_uv_name!r}; "
-                f"uv_render={source_render_uv_name!r}; "
-                f"images={image_summary or 'none'}; "
-                f"pinned_image_inputs="
-                f"{uv_pin_counts['image_inputs']}; "
-                f"pinned_uv_map_nodes="
-                f"{uv_pin_counts['uv_map_nodes']}; "
-                f"pinned_texture_coordinate_nodes="
-                f"{uv_pin_counts['texture_coordinate_nodes']}",
+                f"[material] Node-path composite {source.name!r} "
+                f"on {obj.name!r}: {width}x{height}; "
+                f"alpha={has_alpha}; "
+                f"emission={emission_image is not None}; "
+                f"roughness={roughness_image is not None}; "
+                f"metallic={metallic_image is not None}; "
+                f"uv={active_uv!r}; "
+                f"source_images={len(images)}",
                 flush=True,
             )
 
     for image in bpy.data.images:
-        try:
-            if image.has_data and image.packed_file is None:
+        if (
+            image.users > 0
+            and image.has_data
+            and image.packed_file is None
+        ):
+            try:
                 image.pack()
-        except Exception as exc:
-            print(
-                f"[material] Warning: could not pack "
-                f"{image.name!r}: {exc}",
-                flush=True,
-            )
+            except Exception as exc:
+                print(
+                    f"[material] Could not pack {image.name!r}: {exc}",
+                    flush=True,
+                )
 
 
 def validate_glb_model(output_path, expected_animation_count=None):
