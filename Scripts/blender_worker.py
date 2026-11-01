@@ -1921,9 +1921,7 @@ def prepare_materials_for_gltf(mesh_objects):
 
             gltf_alpha_mode = (
                 "MASK" if alpha_test
-                else "BLEND" if (
-                    use_alpha or has_shader_transparency
-                )
+                else "BLEND" if has_alpha
                 else "OPAQUE"
             )
 
@@ -4573,6 +4571,10 @@ def import_model(input_root, input_path, output_path, output_root):
     if "CANCELLED" in export_result:
         raise RuntimeError("Blender's glTF exporter cancelled the model export.")
 
+    print(
+        "[material] VCT GLB alpha patch reached.",
+        flush=True,
+    )
     _patch_glb_alpha_modes(output_path, export_objects)
 
     validate_glb_model(
