@@ -1712,7 +1712,8 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
             "Composite color/alpha dimensions do not match."
         )
 
-    count = color_image.size[0] * color_image.size[1]
+    width, height = map(int, color_image.size)
+    count = width * height
 
     color = np.empty(count * 4, dtype=np.float32)
     probe = np.empty(count * 4, dtype=np.float32)
@@ -1720,28 +1721,47 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
     color_image.pixels.foreach_get(color)
     alpha_image.pixels.foreach_get(probe)
 
-    opacity = probe[0::4]
-
-    print(
-        f"[material] Alpha pixel probe: "
-        f"min={float(opacity.min()):.4f}; "
-        f"max={float(opacity.max()):.4f}; "
-        f"non-opaque={int(np.count_nonzero(opacity < 0.99999))}; "
-        f"pixels={count}.",
-        flush=True,
-    )
-
-    color[3::4] = np.clip(
+    opacity = np.clip(
         probe[0::4] * factor,
         0.0,
         1.0,
     )
 
-    color_image.pixels.foreach_set(color)
-    color_image.alpha_mode = "STRAIGHT"
-    color_image.update()
+    color[3::4] = opacity
 
-    _repack_modified_image(color_image)
+    merged = bpy.data.images.new(
+        name=f"{color_image.name}_gltf_rgba",
+        width=width,
+        height=height,
+        alpha=True,
+        float_buffer=True,
+    )
+
+    merged.alpha_mode = "STRAIGHT"
+    merged.colorspace_settings.name = (
+        color_image.colorspace_settings.name
+    )
+
+    merged.pixels.foreach_set(color)
+    merged.update()
+
+    if not merged.is_dirty or merged.channels != 4:
+        bpy.data.images.remove(merged, do_unlink=True)
+        raise RuntimeError(
+            "Generated RGBA image did not retain its live pixel buffer."
+        )
+
+    merged["vct_live_rgba"] = True
+
+    print(
+        f"[material] Generated live RGBA image: "
+        f"{merged.name!r}; size={width}x{height}; "
+        f"alpha_min={float(opacity.min()):.4f}; "
+        f"alpha_max={float(opacity.max()):.4f}.",
+        flush=True,
+    )
+
+    return merged
 
 
 def _preserve_sourceio_normal_map(
@@ -1948,7 +1968,7 @@ def prepare_materials_for_gltf(mesh_objects):
                 )
 
                 try:
-                    _merge_rendered_alpha(
+                    merged_image = _merge_rendered_alpha(
                         base_image,
                         alpha_image,
                         alpha_factor,
@@ -1958,6 +1978,9 @@ def prepare_materials_for_gltf(mesh_objects):
                         alpha_image,
                         do_unlink=True,
                     )
+
+                bpy.data.images.remove(base_image, do_unlink=True)
+                base_image = merged_image
 
             emission_image = None
             if (
@@ -2177,6 +2200,7 @@ def prepare_materials_for_gltf(mesh_objects):
             image.users > 0
             and image.has_data
             and image.packed_file is None
+            and not image.get("vct_live_rgba", False)
         ):
             try:
                 image.pack()
