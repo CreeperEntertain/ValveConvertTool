@@ -627,9 +627,6 @@ def _material_uses_channel(material, channel):
 def _bypass_transparency_for_color(node_tree):
     """
     Remove direct Transparent-BSDF branches from a color bake.
-
-    Color should be baked as straight RGB. Baking transparency into RGB as well
-    would premultiply the color and produce dark fringes after glTF export.
     """
     for node in list(node_tree.nodes):
         if node.type == "GROUP" and node.node_tree is not None:
