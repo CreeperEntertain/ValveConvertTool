@@ -2055,14 +2055,35 @@ def prepare_materials_for_gltf(mesh_objects):
                         "Principled Alpha socket."
                     )
 
-                tree.links.new(
-                    base_texture.outputs["Alpha"],
-                    alpha_socket,
-                )
+                alpha_source = base_texture.outputs["Alpha"]
+
+                if gltf_alpha_mode == "MASK":
+                    below_cutoff = tree.nodes.new("ShaderNodeMath")
+                    below_cutoff.name = "VCT Alpha Below Cutoff"
+                    below_cutoff.operation = "LESS_THAN"
+                    below_cutoff.inputs[1].default_value = float(cutoff)
+
+                    tree.links.new(
+                        alpha_source,
+                        below_cutoff.inputs[0],
+                    )
+
+                    alpha_clip = tree.nodes.new("ShaderNodeMath")
+                    alpha_clip.name = "VCT Alpha Mask"
+                    alpha_clip.operation = "SUBTRACT"
+                    alpha_clip.inputs[0].default_value = 1.0
+
+                    tree.links.new(
+                        below_cutoff.outputs[0],
+                        alpha_clip.inputs[1],
+                    )
+
+                    alpha_source = alpha_clip.outputs[0]
+
+                tree.links.new(alpha_source, alpha_socket)
 
                 alpha_linked = any(
-                    link.from_node == base_texture
-                    and link.from_socket == base_texture.outputs["Alpha"]
+                    link.from_socket == alpha_source
                     and link.to_socket == alpha_socket
                     for link in tree.links
                 )
