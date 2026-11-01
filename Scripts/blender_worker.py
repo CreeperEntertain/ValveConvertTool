@@ -1925,13 +1925,8 @@ def prepare_materials_for_gltf(mesh_objects):
                 continue
 
             has_alpha = (
-                _material_uses_channel(source, "alpha")
-                or use_alpha
+                use_alpha
                 or alpha_factor < 0.99999
-                or any(
-                    node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}
-                    for node in nodes
-                )
             )
 
             has_shader_transparency = any(
