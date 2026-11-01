@@ -1914,6 +1914,19 @@ def prepare_materials_for_gltf(mesh_objects):
                 )
             )
 
+            has_shader_transparency = any(
+                node.type in {"BSDF_TRANSPARENT", "HOLDOUT"}
+                for node in nodes
+            )
+
+            gltf_alpha_mode = (
+                "MASK" if alpha_test
+                else "BLEND" if (
+                    use_alpha or has_shader_transparency
+                )
+                else "OPAQUE"
+            )
+
             base_image = _render_sourceio_channel(
                 source,
                 "base_color",
@@ -1989,6 +2002,10 @@ def prepare_materials_for_gltf(mesh_objects):
 
             final = source.copy()
             final.name = f"{source.name}_glTF"
+            final["vct_gltf_alpha_mode"] = gltf_alpha_mode
+
+            if gltf_alpha_mode == "MASK":
+                final["vct_gltf_alpha_cutoff"] = float(cutoff)
 
             tree = final.node_tree
             tree.nodes.clear()
@@ -4156,6 +4173,144 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
     return tracks_created
 
 
+def _patch_glb_alpha_modes(output_path, export_objects):
+    """Enforce Source material alpha modes in the exported GLB."""
+
+    alpha_modes = {}
+
+    for obj in export_objects:
+        if obj.type != "MESH":
+            continue
+
+        for slot in obj.material_slots:
+            material = slot.material
+            if material is None:
+                continue
+
+            mode = material.get("vct_gltf_alpha_mode")
+            if mode not in {"OPAQUE", "MASK", "BLEND"}:
+                continue
+
+            cutoff = float(
+                material.get("vct_gltf_alpha_cutoff", 0.5)
+            )
+
+            value = (mode, cutoff)
+            previous = alpha_modes.get(material.name)
+
+            if previous is not None and previous != value:
+                raise RuntimeError(
+                    f"Conflicting alpha modes for {material.name!r}."
+                )
+
+            alpha_modes[material.name] = value
+
+    if not alpha_modes:
+        return
+
+    with open(output_path, "rb") as file:
+        data = file.read()
+
+    if len(data) < 20:
+        raise RuntimeError("Cannot patch an invalid GLB.")
+
+    magic, version, declared_length = struct.unpack_from(
+        "<4sII", data, 0
+    )
+
+    if magic != b"glTF" or version != 2:
+        raise RuntimeError("Expected a GLB 2.0 file.")
+
+    if declared_length != len(data):
+        raise RuntimeError("GLB length mismatch before alpha patch.")
+
+    json_length, json_type = struct.unpack_from(
+        "<II", data, 12
+    )
+
+    if json_type != 0x4E4F534A:
+        raise RuntimeError("GLB JSON chunk missing.")
+
+    json_end = 20 + json_length
+
+    if json_end > len(data):
+        raise RuntimeError("Invalid GLB JSON chunk length.")
+
+    gltf = json.loads(
+        data[20:json_end]
+        .rstrip(b"\x00 \t\r\n")
+        .decode("utf-8")
+    )
+
+    matched = set()
+
+    for material in gltf.get("materials", []):
+        name = material.get("name")
+
+        if name not in alpha_modes:
+            continue
+
+        mode, cutoff = alpha_modes[name]
+
+        material["alphaMode"] = mode
+
+        if mode == "MASK":
+            material["alphaCutoff"] = cutoff
+        else:
+            material.pop("alphaCutoff", None)
+
+        matched.add(name)
+
+        print(
+            f"[material] GLB alpha mode: "
+            f"{name!r} -> {mode}"
+            + (
+                f" (cutoff={cutoff:.4f})"
+                if mode == "MASK"
+                else ""
+            ),
+            flush=True,
+        )
+
+    missing = set(alpha_modes) - matched
+
+    if missing:
+        raise RuntimeError(
+            "Could not match exported GLB materials by name: "
+            + ", ".join(sorted(missing))
+            + ". Exported names: "
+            + ", ".join(
+                material.get("name", "<unnamed>")
+                for material in gltf.get("materials", [])
+            )
+        )
+
+    json_bytes = json.dumps(
+        gltf,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    json_bytes += b" " * (-len(json_bytes) % 4)
+
+    trailing_chunks = data[json_end:]
+
+    updated = (
+        data[:8]
+        + struct.pack(
+            "<I",
+            20 + len(json_bytes) + len(trailing_chunks),
+        )
+        + struct.pack("<II", len(json_bytes), json_type)
+        + json_bytes
+        + trailing_chunks
+    )
+
+    with open(output_path, "wb") as file:
+        file.write(updated)
+
+
 def import_model(input_root, input_path, output_path, output_root):
     from SourceIO.library.shared.content_manager import ContentManager
     from SourceIO.library.utils.math_utilities import SOURCE1_HAMMER_UNIT_TO_METERS
@@ -4393,6 +4548,8 @@ def import_model(input_root, input_path, output_path, output_root):
 
     if "CANCELLED" in export_result:
         raise RuntimeError("Blender's glTF exporter cancelled the model export.")
+
+    _patch_glb_alpha_modes(output_path, export_objects)
 
     validate_glb_model(
         output_path,
