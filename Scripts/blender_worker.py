@@ -1718,13 +1718,72 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
     color_image.pixels.foreach_get(color)
     alpha_image.pixels.foreach_get(probe)
 
-    opacity = np.clip(
-        probe[0::4] * factor,
+    rgba = color.reshape(height, width, 4)
+    alpha_rgba = probe.reshape(height, width, 4)
+
+    source_alpha = np.clip(alpha_rgba[..., 0], 0.0, 1.0)
+
+    rgb = rgba[..., :3]
+    valid = source_alpha > (1.0 / 255.0)
+
+    rgb[valid] = np.clip(
+        (
+            rgb[valid]
+            - (1.0 - source_alpha[valid, None])
+        )
+        / source_alpha[valid, None],
         0.0,
         1.0,
     )
 
-    color[3::4] = opacity
+    rgb[~valid] = 0.0
+
+    for _ in range(8):
+        padded_rgb = np.pad(
+            rgb,
+            ((1, 1), (1, 1), (0, 0)),
+            mode="edge",
+        )
+        padded_valid = np.pad(
+            valid,
+            ((1, 1), (1, 1)),
+            mode="edge",
+        )
+
+        sums = np.zeros_like(rgb)
+        counts = np.zeros((height, width), dtype=np.float32)
+
+        for dy in range(3):
+            for dx in range(3):
+                if dy == 1 and dx == 1:
+                    continue
+
+                neighbor_valid = padded_valid[
+                    dy:dy + height,
+                    dx:dx + width,
+                ]
+
+                neighbor_rgb = padded_rgb[
+                    dy:dy + height,
+                    dx:dx + width,
+                ]
+
+                sums += neighbor_rgb * neighbor_valid[..., None]
+                counts += neighbor_valid
+
+        fill = (~valid) & (counts > 0.0)
+
+        if not np.any(fill):
+            break
+
+        rgb[fill] = sums[fill] / counts[fill, None]
+        valid[fill] = True
+
+    rgba[..., 3] = np.clip(
+        source_alpha * factor,
+        0.0,
+        1.0,
+    )
 
     merged = bpy.data.images.new(
         name=f"{color_image.name}_gltf_rgba",
@@ -1749,14 +1808,6 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
         )
 
     merged["vct_live_rgba"] = True
-
-    print(
-        f"[material] Generated live RGBA image: "
-        f"{merged.name!r}; size={width}x{height}; "
-        f"alpha_min={float(opacity.min()):.4f}; "
-        f"alpha_max={float(opacity.max()):.4f}.",
-        flush=True,
-    )
 
     return merged
 
