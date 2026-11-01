@@ -1721,18 +1721,17 @@ def _merge_rendered_alpha(color_image, alpha_image, factor=1.0):
     rgba = color.reshape(height, width, 4)
     alpha_rgba = probe.reshape(height, width, 4)
 
-    render_alpha = np.clip(rgba[..., 3].copy(), 0.0, 1.0)
     source_alpha = np.clip(alpha_rgba[..., 0], 0.0, 1.0)
 
     rgb = rgba[..., :3]
-    valid = render_alpha > (1.0 / 255.0)
+    valid = source_alpha > (1.0 / 255.0)
 
     rgb[valid] = np.clip(
         (
             rgb[valid]
-            - (1.0 - render_alpha[valid, None])
+            - (1.0 - source_alpha[valid, None])
         )
-        / render_alpha[valid, None],
+        / source_alpha[valid, None],
         0.0,
         1.0,
     )
