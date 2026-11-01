@@ -4189,7 +4189,28 @@ def _patch_glb_alpha_modes(output_path, export_objects):
 
             mode = material.get("vct_gltf_alpha_mode")
             if mode not in {"OPAQUE", "MASK", "BLEND"}:
-                continue
+                surface_method = getattr(
+                    material, "surface_render_method", ""
+                )
+                blend_method = getattr(
+                    material, "blend_method", ""
+                )
+
+                if surface_method == "DITHERED" or blend_method == "CLIP":
+                    mode = "MASK"
+                elif (
+                    surface_method == "BLENDED"
+                    or blend_method == "BLEND"
+                ):
+                    mode = "BLEND"
+                else:
+                    continue
+
+                print(
+                    f"[material] Alpha mode inferred for "
+                    f"{material.name!r}: {mode}",
+                    flush=True,
+                )
 
             cutoff = float(
                 material.get("vct_gltf_alpha_cutoff", 0.5)
@@ -4206,7 +4227,10 @@ def _patch_glb_alpha_modes(output_path, export_objects):
             alpha_modes[material.name] = value
 
     if not alpha_modes:
-        return
+        raise RuntimeError(
+            "[material] GLB alpha patch found no tagged or "
+            "transparent materials. No alpha modes were changed."
+        )
 
     with open(output_path, "rb") as file:
         data = file.read()
