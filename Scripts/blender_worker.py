@@ -2048,10 +2048,41 @@ def prepare_materials_for_gltf(mesh_objects):
 
             if has_alpha:
                 alpha_socket = bsdf.inputs.get("Alpha")
-                if alpha_socket is not None:
-                    tree.links.new(
-                        base_texture.outputs["Alpha"],
-                        alpha_socket,
+
+                if alpha_socket is None:
+                    raise RuntimeError(
+                        f"{final.name!r} has alpha data but no "
+                        "Principled Alpha socket."
+                    )
+
+                tree.links.new(
+                    base_texture.outputs["Alpha"],
+                    alpha_socket,
+                )
+
+                alpha_linked = any(
+                    link.from_node == base_texture
+                    and link.from_socket == base_texture.outputs["Alpha"]
+                    and link.to_socket == alpha_socket
+                    for link in tree.links
+                )
+
+                print(
+                    f"[material] Alpha link verified: "
+                    f"{final.name!r}; "
+                    f"image={base_image.name!r}; "
+                    f"channels={base_image.channels}; "
+                    f"size={tuple(base_image.size)}; "
+                    f"alpha_mode={base_image.alpha_mode!r}; "
+                    f"gltf_mode={gltf_alpha_mode}; "
+                    f"linked={alpha_linked}.",
+                    flush=True,
+                )
+
+                if not alpha_linked:
+                    raise RuntimeError(
+                        f"Failed to link merged image alpha "
+                        f"for {final.name!r}."
                     )
 
             if roughness_image is not None:
@@ -4171,6 +4202,299 @@ def prepare_animation_tracks_for_gltf(armature_objects, actions):
     return tracks_created
 
 
+def _decode_webp_to_png(webp_data, image_name):
+    """Decode an embedded WebP into a PNG fallback, retaining its alpha."""
+    with tempfile.TemporaryDirectory(
+        prefix="vct_webp_fallback_"
+    ) as temp_dir:
+        webp_path = os.path.join(temp_dir, "source.webp")
+        png_path = os.path.join(temp_dir, "fallback.png")
+
+        with open(webp_path, "wb") as file:
+            file.write(webp_data)
+
+        image = bpy.data.images.load(
+            webp_path,
+            check_existing=False,
+        )
+
+        try:
+            if not image.has_data or min(image.size) <= 0:
+                raise RuntimeError(
+                    f"Could not decode WebP image {image_name!r}."
+                )
+
+            image.alpha_mode = "STRAIGHT"
+            image.filepath_raw = png_path
+            image.file_format = "PNG"
+            image.save()
+
+            with open(png_path, "rb") as file:
+                png_data = file.read()
+
+            if not png_data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise RuntimeError(
+                    f"PNG fallback encoding failed for {image_name!r}."
+                )
+
+            return png_data
+
+        finally:
+            bpy.data.images.remove(image, do_unlink=True)
+
+
+def _patch_glb_webp_fallbacks(output_path):
+    """
+    Add core PNG fallback images to WebP textures.
+    """
+    WEBP_EXTENSION = "EXT_texture_webp"
+    JSON_CHUNK = 0x4E4F534A
+    BIN_CHUNK = 0x004E4942
+
+    with open(output_path, "rb") as file:
+        data = file.read()
+
+    if len(data) < 20:
+        raise RuntimeError("Cannot add WebP fallbacks to an invalid GLB.")
+
+    magic, version, declared_length = struct.unpack_from(
+        "<4sII", data, 0
+    )
+
+    if magic != b"glTF" or version != 2:
+        raise RuntimeError("Expected a GLB 2.0 file.")
+
+    if declared_length != len(data):
+        raise RuntimeError("GLB length mismatch before WebP fallback patch.")
+
+    chunks = []
+    cursor = 12
+
+    while cursor < len(data):
+        if cursor + 8 > len(data):
+            raise RuntimeError("Truncated GLB chunk header.")
+
+        chunk_length, chunk_type = struct.unpack_from(
+            "<II", data, cursor
+        )
+
+        start = cursor + 8
+        end = start + chunk_length
+
+        if end > len(data):
+            raise RuntimeError("Truncated GLB chunk payload.")
+
+        chunks.append((chunk_type, data[start:end]))
+        cursor = end
+
+    json_chunks = [
+        payload for kind, payload in chunks
+        if kind == JSON_CHUNK
+    ]
+    bin_chunks = [
+        payload for kind, payload in chunks
+        if kind == BIN_CHUNK
+    ]
+
+    if len(json_chunks) != 1:
+        raise RuntimeError("GLB must contain exactly one JSON chunk.")
+
+    if len(bin_chunks) != 1:
+        raise RuntimeError(
+            "GLB must contain exactly one BIN chunk for WebP fallbacks."
+        )
+
+    gltf = json.loads(
+        json_chunks[0]
+        .rstrip(b"\x00 \t\r\n")
+        .decode("utf-8")
+    )
+
+    buffers = gltf.get("buffers", [])
+    buffer_views = gltf.get("bufferViews", [])
+    images = gltf.get("images", [])
+    textures = gltf.get("textures", [])
+
+    if not buffers:
+        raise RuntimeError("GLB has no embedded buffer.")
+
+    original_bin = bin_chunks[0]
+    original_buffer_length = int(buffers[0]["byteLength"])
+
+    if original_buffer_length > len(original_bin):
+        raise RuntimeError("GLB buffer exceeds its BIN chunk.")
+
+    binary = bytearray(original_bin[:original_buffer_length])
+
+    fallback_by_webp_index = {}
+    fallback_count = 0
+
+    for texture_index, texture in enumerate(textures):
+        extensions = texture.get("extensions") or {}
+        webp_extension = extensions.get(WEBP_EXTENSION)
+
+        if not isinstance(webp_extension, dict):
+            continue
+
+        webp_index = webp_extension.get("source")
+
+        if not isinstance(webp_index, int):
+            raise RuntimeError(
+                f"Texture {texture_index} has an invalid WebP source."
+            )
+
+        if webp_index in fallback_by_webp_index:
+            texture["source"] = fallback_by_webp_index[webp_index]
+            continue
+
+        if not 0 <= webp_index < len(images):
+            raise RuntimeError(
+                f"Texture {texture_index} references missing WebP image "
+                f"{webp_index}."
+            )
+
+        webp_image = images[webp_index]
+
+        if webp_image.get("mimeType") != "image/webp":
+            raise RuntimeError(
+                f"Image {webp_index} is not declared as image/webp."
+            )
+
+        view_index = webp_image.get("bufferView")
+
+        if not isinstance(view_index, int) or not (
+            0 <= view_index < len(buffer_views)
+        ):
+            raise RuntimeError(
+                f"WebP image {webp_index} has no valid embedded bufferView."
+            )
+
+        webp_view = buffer_views[view_index]
+
+        if webp_view.get("buffer", 0) != 0:
+            raise RuntimeError(
+                f"WebP image {webp_index} references an unexpected buffer."
+            )
+
+        webp_offset = int(webp_view.get("byteOffset", 0))
+        webp_length = int(webp_view["byteLength"])
+        webp_end = webp_offset + webp_length
+
+        if webp_offset < 0 or webp_end > original_buffer_length:
+            raise RuntimeError(
+                f"WebP image {webp_index} exceeds the GLB buffer."
+            )
+
+        webp_data = original_bin[webp_offset:webp_end]
+
+        if webp_data[8:12] != b"WEBP":
+            raise RuntimeError(
+                f"Image {webp_index} does not contain valid WebP data."
+            )
+
+        png_data = _decode_webp_to_png(
+            webp_data,
+            webp_image.get("name", f"image_{webp_index}"),
+        )
+
+        binary.extend(b"\x00" * (-len(binary) % 4))
+        png_offset = len(binary)
+        binary.extend(png_data)
+
+        png_view_index = len(buffer_views)
+        buffer_views.append({
+            "buffer": 0,
+            "byteOffset": png_offset,
+            "byteLength": len(png_data),
+        })
+
+        png_image_index = len(images)
+        images.append({
+            "name": (
+                f"{webp_image.get('name', f'image_{webp_index}')}"
+                "_png_fallback"
+            ),
+            "mimeType": "image/png",
+            "bufferView": png_view_index,
+        })
+
+        texture["source"] = png_image_index
+        fallback_by_webp_index[webp_index] = png_image_index
+        fallback_count += 1
+
+        print(
+            f"[material] GLB texture {texture_index}: "
+            f"WebP image {webp_index}, PNG fallback {png_image_index}.",
+            flush=True,
+        )
+
+    if fallback_count == 0:
+        print(
+            "[material] GLB contains no EXT_texture_webp textures.",
+            flush=True,
+        )
+        return 0
+
+    required = gltf.get("extensionsRequired", [])
+    required = [
+        extension
+        for extension in required
+        if extension != WEBP_EXTENSION
+    ]
+
+    if required:
+        gltf["extensionsRequired"] = required
+    else:
+        gltf.pop("extensionsRequired", None)
+
+    used = gltf.setdefault("extensionsUsed", [])
+    if WEBP_EXTENSION not in used:
+        used.append(WEBP_EXTENSION)
+
+    buffers[0]["byteLength"] = len(binary)
+
+    json_data = json.dumps(
+        gltf,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    json_data += b" " * (-len(json_data) % 4)
+
+    bin_data = bytes(binary)
+    bin_data += b"\x00" * (-len(bin_data) % 4)
+
+    updated = bytearray(
+        struct.pack("<4sII", b"glTF", 2, 0)
+    )
+
+    for chunk_type, payload in chunks:
+        if chunk_type == JSON_CHUNK:
+            payload = json_data
+        elif chunk_type == BIN_CHUNK:
+            payload = bin_data
+
+        updated.extend(
+            struct.pack("<II", len(payload), chunk_type)
+        )
+        updated.extend(payload)
+
+    struct.pack_into("<I", updated, 8, len(updated))
+
+    with open(output_path, "wb") as file:
+        file.write(updated)
+
+    print(
+        f"[material] GLB WebP fallback patch: "
+        f"{fallback_count} PNG fallback image(s); "
+        f"WebP remains enabled and optional.",
+        flush=True,
+    )
+
+    return fallback_count
+
+
 def _patch_glb_alpha_modes(output_path, export_objects):
     """Enforce Source material alpha modes in the exported GLB."""
 
@@ -4576,6 +4900,7 @@ def import_model(input_root, input_path, output_path, output_root):
         flush=True,
     )
     _patch_glb_alpha_modes(output_path, export_objects)
+    _patch_glb_webp_fallbacks(output_path)
 
     validate_glb_model(
         output_path,

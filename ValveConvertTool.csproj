@@ -9,7 +9,7 @@
 
 	<ItemGroup>
 		<None Update="Scripts\blender_worker.py">
-			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
 		</None>
 		<None Update="Scripts\versioned_content.py">
 		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
